@@ -3,3 +3,4 @@ numpy>=1.23.0
 pandas>=1.5.0
 gpaw>=25.7.0
 pymatgen>=2023.0.0
+fairchem-core>=1.1.0

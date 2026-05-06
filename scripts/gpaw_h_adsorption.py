@@ -42,12 +42,13 @@ GPAW_OUTPUTS = DATA_OUTPUTS / "gpaw_calculations"
 H2_REFERENCE_FILE = DATA_OUTPUTS / "h2_reference_energy.json"
 OUTPUT_CSV = DATA_OUTPUTS / "gpaw_h_adsorption_results_v2.csv"
 OUTPUT_JSON = DATA_OUTPUTS / "gpaw_h_adsorption_results_v2.json"
+ADSORBML_OUTPUT_CSV = DATA_OUTPUTS / "gpaw_adsorbml_results.csv"
 
 # Configuration
 GPAW_CONFIG = {
     'mode': 'lcao',          # Linear Combination of Atomic Orbitals (faster)
     'basis': 'dzp',          # Double-zeta + polarization (good accuracy)
-    'xc': 'LDA',             # Exchange-correlation functional
+    'xc': 'PBE',             # Exchange-correlation functional
     'kpts': (4, 4, 1),       # K-point mesh for slab
     'txt': 'gpaw.txt',       # Output log file
     'convergence': {
@@ -79,6 +80,9 @@ CSV_COLUMNS = [
     'adsorption_site', 'h2_source', 'relaxed',
     'status', 'timestamp',
 ]
+
+# CSV header for AdsorbML-mode results (separate file, includes ML comparison column)
+ADSORBML_CSV_COLUMNS = CSV_COLUMNS + ['gibbs_free_ml_eV']
 
 # ── Graceful shutdown ────────────────────────────────────────────
 _shutdown_requested = False
@@ -131,14 +135,14 @@ def _set_thread_env(threads_per_calc):
 
 
 # ── Incremental CSV ──────────────────────────────────────────────
-def _ensure_csv_header(csv_path):
+def _ensure_csv_header(csv_path, columns=None):
     """Create CSV with header if it doesn't exist."""
     csv_path = Path(csv_path)
     if not csv_path.exists():
         csv_path.parent.mkdir(parents=True, exist_ok=True)
         with open(csv_path, 'w', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow(CSV_COLUMNS)
+            writer.writerow(columns if columns is not None else CSV_COLUMNS)
 
 
 def _append_result_csv(result_row, csv_path):
@@ -547,7 +551,7 @@ def calculate_surface_properties(formula, miller, slab_file, output_dir, e_h2, h
         result['E_h2'],
         result['ΔGH'],
         result['ΔGH'],  # descriptor_eV = ΔGH
-        'GPAW_LDA',
+        f'GPAW_{GPAW_CONFIG["xc"]}',
         result.get('adsorption_site'),
         result.get('h2_source'),
         result.get('relaxed'),
@@ -619,6 +623,123 @@ def _compute_one(args):
         print(f"⏱ Finished worker task {formula} {surface} in {elapsed_min:.1f} min")
         if max_seconds and max_seconds > 0:
             signal.alarm(0)
+
+
+# ── AdsorbML mode ───────────────────────────────────────────────
+def _load_adsorbml_structures(csv_path):
+    """Read ranked_candidates.csv and return list of dicts for _compute_one_adsorbml."""
+    df = pd.read_csv(csv_path)
+    required = {'slab_name', 'slab_file', 'candidate_file', 'gibbs_free_ml_eV'}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"ranked_candidates.csv missing columns: {missing}")
+    return df.to_dict('records')
+
+
+def _compute_one_adsorbml(args):
+    """Worker for AdsorbML mode: single-point DFT on a pre-relaxed slab + adslab."""
+    row, e_h2, h2_source = args
+    slab_name    = row['slab_name']
+    slab_file    = row['slab_file']
+    adslab_file  = row['candidate_file']
+    gibbs_ml     = row['gibbs_free_ml_eV']
+
+    output_dir = str(GPAW_OUTPUTS / slab_name)
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+
+    print(f"\n{'='*60}")
+    print(f"AdsorbML DFT validation: {slab_name}")
+    print(f"  ML ΔG*H = {gibbs_ml:.4f} eV")
+    print(f"{'='*60}")
+
+    timestamp = datetime.now().isoformat()
+    status = 'failed'
+    e_clean = e_with_h = dgh = None
+
+    try:
+        clean_slab = _prepare_slab(slab_file)
+        clean_slab.calc = setup_gpaw_calculator(label=f'{output_dir}/clean_slab')
+        e_clean = clean_slab.get_potential_energy()
+        print(f"     ✓ Clean slab: E = {e_clean:.6f} eV")
+
+        adslab = _prepare_slab(adslab_file)
+        adslab.calc = setup_gpaw_calculator(label=f'{output_dir}/adslab')
+        e_with_h = adslab.get_potential_energy()
+        print(f"     ✓ Adslab: E = {e_with_h:.6f} eV")
+
+        dgh = e_with_h - e_clean - 0.5 * e_h2
+        status = 'completed'
+        print(f"  ΔGH (DFT) = {dgh:.6f} eV   ML = {gibbs_ml:.4f} eV")
+
+    except Exception as exc:
+        print(f"  ✗ Error: {exc}")
+
+    row_data = [
+        slab_name, slab_name, 'H',
+        e_clean, e_with_h, e_h2,
+        dgh, dgh, f'GPAW_{GPAW_CONFIG["xc"]}_adsorbml',
+        'adsorbml_best', h2_source, False,
+        status, timestamp, gibbs_ml,
+    ]
+    _append_result_csv(row_data, ADSORBML_OUTPUT_CSV)
+    return {'formula': slab_name, 'surface': slab_name, 'status': status,
+            'ΔGH': dgh, 'gibbs_free_ml_eV': gibbs_ml, 'timestamp': timestamp}
+
+
+def run_adsorbml_calculations(candidates_csv, workers_override=None, selected_names=None):
+    """Run single-point GPAW on AdsorbML pre-relaxed structures."""
+    print("\n" + "="*60)
+    print("GPAW AdsorbML Validation Mode")
+    print("="*60)
+    print(f"Starting time: {datetime.now()}")
+    print(f"Candidates CSV: {candidates_csv}")
+
+    _ensure_csv_header(ADSORBML_OUTPUT_CSV, columns=ADSORBML_CSV_COLUMNS)
+
+    completed = _load_completed_keys(ADSORBML_OUTPUT_CSV)
+    if completed:
+        print(f"✓ Checkpoint: {len(completed)} structures already completed, will skip")
+
+    e_h2, h2_source = get_h2_reference_energy()
+
+    structures = _load_adsorbml_structures(candidates_csv)
+    if selected_names:
+        selected_set = set(selected_names)
+        structures = [s for s in structures if s['slab_name'] in selected_set]
+
+    pending = [
+        (row, e_h2, h2_source)
+        for row in structures
+        if (row['slab_name'], row['slab_name']) not in completed
+    ]
+    print(f"Structures to compute: {len(pending)} (skipped {len(structures) - len(pending)} completed)")
+
+    if not pending:
+        print("✓ All structures already completed!")
+        return []
+
+    max_workers = _detect_max_workers(override_workers=workers_override)
+    all_results = []
+
+    if max_workers <= 1:
+        for args in pending:
+            if _shutdown_requested:
+                break
+            all_results.append(_compute_one_adsorbml(args))
+    else:
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            future_map = {executor.submit(_compute_one_adsorbml, args): args for args in pending}
+            for future in as_completed(future_map):
+                if _shutdown_requested:
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    break
+                try:
+                    all_results.append(future.result())
+                except Exception as exc:
+                    args = future_map[future]
+                    print(f"  ✗ Worker exception for {args[0]['slab_name']}: {exc}")
+
+    return all_results
 
 
 def run_calculations_parallel(formulas=['MoS2', 'MoSe2', 'MoP', 'Mo2N'],
@@ -889,6 +1010,14 @@ def main():
         '--max-hours-per-structure', type=float, default=0.0,
         help='Hard timeout per structure in hours (0 disables timeout)',
     )
+    parser.add_argument(
+        '--adsorbml-candidates', type=str, default=None,
+        metavar='PATH',
+        help='Path to ranked_candidates.csv from scripts/adsorbml/3-extract_rank.py. '
+             'When provided, skips POSCAR discovery and H-site search and instead '
+             'runs single-point DFT on AdsorbML pre-relaxed structures. '
+             'Results are written to data/outputs/gpaw_adsorbml_results.csv.',
+    )
     args = parser.parse_args()
 
     # Resolve include patterns
@@ -954,29 +1083,48 @@ def main():
         args.workers = 1
         print("Single-structure mode: forcing workers=1 for scheduler-friendly execution")
 
-    # Invalidate H2 cache if relaxation config changed
+    # Invalidate H2 cache if relaxation config or XC functional changed
     if H2_REFERENCE_FILE.exists():
         try:
             with open(H2_REFERENCE_FILE, 'r') as f:
                 cache = json.load(f)
-            cached_steps = cache.get('gpaw_config', {}).get('relaxation_steps')
+            cached_steps = cache.get('relaxation_steps')
+            cached_xc = cache.get('gpaw_config', {}).get('xc')
             if cached_steps != RELAXATION_CONFIG['steps']:
-                print(f"⚠️  H2 cache config mismatch (cached steps={cached_steps}), recomputing")
+                print(f"⚠️  H2 cache mismatch (steps {cached_steps}→{RELAXATION_CONFIG['steps']}), recomputing")
+                H2_REFERENCE_FILE.unlink()
+            elif cached_xc != GPAW_CONFIG['xc']:
+                print(f"⚠️  H2 cache mismatch (xc {cached_xc}→{GPAW_CONFIG['xc']}), recomputing")
                 H2_REFERENCE_FILE.unlink()
         except Exception:
             pass
     
-    # Run calculations
+    # ── AdsorbML validation mode ─────────────────────────────────
+    if args.adsorbml_candidates:
+        candidates_path = Path(args.adsorbml_candidates)
+        if not candidates_path.exists():
+            raise FileNotFoundError(f"--adsorbml-candidates file not found: {candidates_path}")
+        results = run_adsorbml_calculations(
+            candidates_csv=str(candidates_path),
+            workers_override=args.workers,
+            selected_names=selected_structure_names,
+        )
+        save_results(results, csv_file=ADSORBML_OUTPUT_CSV)
+        print("\n✓ Done! AdsorbML DFT results saved to:")
+        print(f"  - {ADSORBML_OUTPUT_CSV}")
+        return
+
+    # ── Standard fresh-POSCAR mode ───────────────────────────────
     results = run_calculations_parallel(
         include_patterns=include_patterns,
         selected_structure_names=selected_structure_names,
         workers_override=args.workers,
         max_hours_per_structure=args.max_hours_per_structure,
     )
-    
+
     # Save JSON summary
     save_results(results)
-    
+
     print("\n✓ Done! Results saved to:")
     print(f"  - {OUTPUT_CSV} (incremental, crash-safe)")
     print(f"  - {OUTPUT_JSON} (JSON summary)")
