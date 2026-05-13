@@ -17,6 +17,8 @@ import ast
 import glob
 import logging
 import os
+import subprocess
+import traceback
 import multiprocessing as mp
 from datetime import datetime
 from pathlib import Path
@@ -25,6 +27,7 @@ import pandas as pd
 import torch
 import ase.io
 from ase.optimize import LBFGS
+from ase.constraints import FixAtoms
 from fairchem.data.oc.core import Slab
 from fairchem.core.components.calculate.recipes.adsorbml import run_adsorbml
 from fairchem.core import FAIRChemCalculator
@@ -113,6 +116,12 @@ def process_row(row: dict, calc) -> None:
 
     try:
         atoms = ase.io.read(slab_file)
+        # tag=2 is reserved for adsorbate atoms; clamp any slab atoms mistakenly tagged 2 → 0
+        tags = atoms.get_tags()
+        tags[tags == 2] = 0
+        atoms.set_tags(tags)
+        if not atoms.constraints:
+            atoms.set_constraint(FixAtoms(mask=[t == 0 for t in atoms.get_tags()]))
         slab  = Slab(bulk=None, slab_atoms=atoms, millers=millers,
                      shift=None, top=None, oriented_bulk=None)
     except Exception as exc:
@@ -127,13 +136,12 @@ def process_row(row: dict, calc) -> None:
             calculator=calc,
             optimizer_cls=LBFGS,
             fmax=0.02,
-            steps=200,
-            num_placements=100,
+            steps=1,
+            num_placements=10,
             reference_ml_energies=True,
-            place_on_relaxed_slab=False,
         )
     except Exception as exc:
-        comp_log.error(f"run_adsorbml failed: {exc}")
+        comp_log.error(f"run_adsorbml failed: {exc}\n{traceback.format_exc()}")
         _close_log(comp_log)
         return
 
@@ -185,6 +193,7 @@ def _detect_gpus() -> list:
 
 
 def _worker(gpu_id, worker_idx: int, task_queue) -> None:
+    _setup_logging()
     if gpu_id is not None:
         os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
         device = "cuda"

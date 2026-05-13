@@ -21,12 +21,15 @@ import argparse
 import logging
 import multiprocessing as mp
 import re
+import subprocess
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import torch
 from ase.io import read, write
 from ase.optimize import LBFGS
+from ase.constraints import FixAtoms
 from fairchem.core import FAIRChemCalculator
 
 # Import discover_structures from the sibling scripts/ directory
@@ -41,7 +44,7 @@ MANIFEST_CSV    = REPO_ROOT / "data" / "adsorbml_manifest.csv"
 MIN_FREE_VRAM_GB = 8.0
 WORKERS_PER_GPU  = 1
 FMAX             = 0.02
-MAX_STEPS        = 200
+MAX_STEPS        = 1
 
 # Structures excluded from AdsorbML (not 2D-periodic surface slabs or off-topic)
 _EXCLUDE = ("graphene", "nanoribbon", "edge")
@@ -60,18 +63,18 @@ def _parse_millers(name: str) -> tuple:
     return (0, 0, 1)
 
 
+def _tile_slab(atoms):
+    """Repeat the slab in a and b until both cell dimensions are >= 8 Å (required by ocp_adslab_generator)."""
+    cell = atoms.get_cell()
+    na = max(1, int(np.ceil(8.0 / np.linalg.norm(cell[0]))))
+    nb = max(1, int(np.ceil(8.0 / np.linalg.norm(cell[1]))))
+    return atoms.repeat([na, nb, 1]) if (na > 1 or nb > 1) else atoms
+
+
 def _tag_atoms(atoms):
-    """Assign surface tags needed by AdsorbML: 1=surface, 2=subsurface, 0=bulk."""
+    """Assign OC20 surface tags: 1=surface layer, 0=subsurface/bulk. tag=2 is reserved for adsorbates."""
     z_max = atoms.positions[:, 2].max()
-    tags = []
-    for atom in atoms:
-        z = atom.position[2]
-        if z > z_max - 1.5:
-            tags.append(1)
-        elif z > z_max - 4.0:
-            tags.append(2)
-        else:
-            tags.append(0)
+    tags = [1 if atom.position[2] > z_max - 2.0 else 0 for atom in atoms]
     atoms.set_tags(tags)
     return atoms
 
@@ -87,7 +90,9 @@ def _relax_one(name: str, poscar_path: Path, calc) -> None:
     log.info(f"Start: {name}")
     try:
         atoms = read(str(poscar_path))
+        atoms = _tile_slab(atoms)
         atoms = _tag_atoms(atoms)
+        atoms.set_constraint(FixAtoms(mask=[t == 0 for t in atoms.get_tags()]))
         atoms.calc = calc
         opt = LBFGS(atoms, logfile=str(UMA_RELAXED / f"{name}_opt.log"))
         opt.run(fmax=FMAX, steps=MAX_STEPS)
