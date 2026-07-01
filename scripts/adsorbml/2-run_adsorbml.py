@@ -1,43 +1,47 @@
 """
 scripts/adsorbml/2-run_adsorbml.py
 
-AdsorbML step 2: Screen H* adsorption candidates on UMA-M relaxed slabs using
-AdsorbML (100 placements per slab, ML-relaxed with UMA-M OC20 head).
+AdsorbML step 2 (map: screen): Screen H* adsorption candidates on UMA-M relaxed
+slabs using AdsorbML (NUM_PLACEMENTS placements per slab, ML-relaxed with the
+UMA-M OC20 head).
 
-Reads:  data/adsorbml_manifest.csv
-Writes: data/adsorbml_results/<name>/candidates.csv
-        data/adsorbml_results/<name>/candidate_*.traj
-        data/adsorbml_results/<name>/adsorbml.log
-        data/adsorbml_results/batch_summary.csv
+Reads:  <data>/adsorbml_manifest.csv
+Writes: <data>/adsorbml_results/<name>/candidates.csv
+        <data>/adsorbml_results/<name>/candidate_*.traj
+        <data>/adsorbml_results/<name>/adsorbml.log
+        <data>/adsorbml_results/batch_summary.csv   (reduce; single run only)
 
-Usage:
+`<data>` is the repo's data/ dir, or $ADSORBML_DATA_ROOT if set (HPC scratch).
+
+Usage (local — one command; batch summary written automatically):
   python scripts/adsorbml/2-run_adsorbml.py
+
+Usage (HPC SLURM array — shard the screening, then summarise ONCE):
+  python scripts/adsorbml/2-run_adsorbml.py --shard $SLURM_ARRAY_TASK_ID/8
+  python scripts/adsorbml/2-run_adsorbml.py --summary-only    # optional reduce
 """
-import ast
+import argparse
 import glob
 import logging
-import os
-import subprocess
+import sys
 import traceback
-import multiprocessing as mp
 from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
-import torch
 import ase.io
+from ase.calculators.singlepoint import SinglePointCalculator
 from ase.optimize import LBFGS
 from ase.constraints import FixAtoms
 from fairchem.data.oc.core import Slab
 from fairchem.core.components.calculate.recipes.adsorbml import run_adsorbml
-from fairchem.core import FAIRChemCalculator
 
-REPO_ROOT        = Path(__file__).resolve().parents[2]
-MANIFEST_CSV     = REPO_ROOT / "data" / "adsorbml_manifest.csv"
-OUT_DIR          = REPO_ROOT / "data" / "adsorbml_results"
-ADSORBATE_SMILES = "*H"
-MIN_FREE_VRAM_GB = 8.0
-WORKERS_PER_GPU  = 1
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _common import (
+    MANIFEST_CSV, OUT_DIR, ADSORBATE_SMILES, FMAX, MAX_STEPS, NUM_PLACEMENTS,
+    setup_logging, parse_millers, get_shard, apply_shard,
+    write_atomic_csv, run_gpu_workers,
+)
 
 _CANDIDATES_COLS = [
     "candidate_rank", "E_adslab_ml_eV", "E_slab_ml_eV",
@@ -45,35 +49,13 @@ _CANDIDATES_COLS = [
 ]
 
 master_log = logging.getLogger("adsorbml.master")
+# Per-slab file/console logging uses its own formatters (kept local to step 2).
 _LOG_FMT = logging.Formatter(
     "%(asctime)s  %(levelname)-8s  %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
 )
 _COMPOUND_LOG_FMT = logging.Formatter(
     "%(asctime)s  %(levelname)-8s  [%(name)s]  %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
 )
-
-
-def _setup_logging(log_path=None) -> None:
-    master_log.setLevel(logging.DEBUG)
-    if master_log.handlers:
-        return
-    ch = logging.StreamHandler()
-    ch.setFormatter(_LOG_FMT)
-    master_log.addHandler(ch)
-    if log_path:
-        fh = logging.FileHandler(log_path, mode="a", encoding="utf-8")
-        fh.setFormatter(_LOG_FMT)
-        master_log.addHandler(fh)
-
-
-def _parse_millers(millers_str) -> tuple:
-    if isinstance(millers_str, tuple):
-        return millers_str
-    try:
-        v = ast.literal_eval(str(millers_str))
-        return v if isinstance(v, tuple) else (0, 0, 1)
-    except Exception:
-        return (0, 0, 1)
 
 
 def _is_done(slab_name: str) -> bool:
@@ -89,7 +71,7 @@ def _close_log(log: logging.Logger) -> None:
 def process_row(row: dict, calc) -> None:
     slab_file = row["slab_file"]
     slab_name = row["slab_name"]
-    millers   = _parse_millers(row["millers"])
+    millers   = parse_millers(row["millers"])
 
     run_dir  = OUT_DIR / slab_name
     done_csv = run_dir / "candidates.csv"
@@ -116,10 +98,6 @@ def process_row(row: dict, calc) -> None:
 
     try:
         atoms = ase.io.read(slab_file)
-        # tag=2 is reserved for adsorbate atoms; clamp any slab atoms mistakenly tagged 2 → 0
-        tags = atoms.get_tags()
-        tags[tags == 2] = 0
-        atoms.set_tags(tags)
         if not atoms.constraints:
             atoms.set_constraint(FixAtoms(mask=[t == 0 for t in atoms.get_tags()]))
         slab  = Slab(bulk=None, slab_atoms=atoms, millers=millers,
@@ -135,9 +113,9 @@ def process_row(row: dict, calc) -> None:
             adsorbate=ADSORBATE_SMILES,
             calculator=calc,
             optimizer_cls=LBFGS,
-            fmax=0.02,
-            steps=1,
-            num_placements=10,
+            fmax=FMAX,
+            steps=MAX_STEPS,
+            num_placements=NUM_PLACEMENTS,
             reference_ml_energies=True,
         )
     except Exception as exc:
@@ -148,14 +126,24 @@ def process_row(row: dict, calc) -> None:
     candidates = outputs["adslabs"]
     if not candidates:
         comp_log.warning(f"No valid placements for {slab_name}")
-        pd.DataFrame(columns=_CANDIDATES_COLS).to_csv(done_csv, index=False)
+        write_atomic_csv(pd.DataFrame(columns=_CANDIDATES_COLS), done_csv)
         _close_log(comp_log)
         return
 
     rows = []
     for i, cand in enumerate(candidates):
         traj_path = str(run_dir / f"candidate_{i}.traj")
-        ase.io.write(traj_path, cand["atoms"])
+        atoms = cand["atoms"]
+        try:
+            spc = SinglePointCalculator(
+                atoms,
+                energy=atoms.get_potential_energy(),
+                forces=atoms.get_forces(),
+            )
+            atoms.calc = spc
+        except Exception:
+            pass
+        ase.io.write(traj_path, atoms)
         res = cand["results"]
         ref = res.get("referenced_adsorption_energy", {})
         rows.append({
@@ -168,88 +156,14 @@ def process_row(row: dict, calc) -> None:
             "traj_path":       traj_path,
         })
 
-    pd.DataFrame(rows).to_csv(done_csv, index=False)
+    write_atomic_csv(pd.DataFrame(rows), done_csv)
     best_e = min(r["E_ads_ml_eV"] for r in rows)
     comp_log.info(f"Best E_ads (ML) = {best_e:.4f} eV  ({len(candidates)} candidates)")
     _close_log(comp_log)
 
 
-def _detect_gpus() -> list:
-    if not torch.cuda.is_available():
-        return []
-    eligible = []
-    master_log.info("GPU inventory:")
-    for i in range(torch.cuda.device_count()):
-        props    = torch.cuda.get_device_properties(i)
-        free_gb  = torch.cuda.mem_get_info(i)[0] / 1e9
-        total_gb = torch.cuda.mem_get_info(i)[1] / 1e9
-        ok = free_gb >= MIN_FREE_VRAM_GB
-        status = "OK" if ok else f"LOW VRAM – skipped"
-        master_log.info(f"  GPU {i}: {props.name}  {free_gb:.1f}/{total_gb:.1f} GB  [{status}]")
-        if ok:
-            eligible.append((free_gb, i))
-    eligible.sort(reverse=True)
-    return [i for _, i in eligible]
-
-
-def _worker(gpu_id, worker_idx: int, task_queue) -> None:
-    _setup_logging()
-    if gpu_id is not None:
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-        device = "cuda"
-    else:
-        device = "cpu"
-    master_log.info(f"Loading UMA-M OC20 on {device} (worker {worker_idx})...")
-    calc = FAIRChemCalculator.from_model_checkpoint("uma-m-1p1", task_name="oc20", device=device)
-    while True:
-        row = task_queue.get()
-        if row is None:
-            break
-        process_row(row, calc)
-
-
-if __name__ == "__main__":
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    log_path = str(OUT_DIR / f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
-    _setup_logging(log_path)
-    master_log.info(f"Log: {log_path}")
-
-    master_log.info("Detecting GPUs...")
-    gpu_ids  = _detect_gpus()
-    n_workers = len(gpu_ids) * WORKERS_PER_GPU if gpu_ids else 1
-    if gpu_ids:
-        master_log.info(f"Launching {n_workers} worker(s) across GPU(s): {gpu_ids}")
-    else:
-        master_log.warning("No eligible GPU — running on CPU.")
-
-    df       = pd.read_csv(MANIFEST_CSV)
-    all_rows = df.to_dict("records")
-    pending  = [r for r in all_rows if not _is_done(r["slab_name"])]
-    master_log.info(
-        f"Total: {len(all_rows)}  |  Done: {len(all_rows) - len(pending)}  |  Pending: {len(pending)}"
-    )
-
-    if not gpu_ids:
-        gpu_ids = [None]
-
-    if pending:
-        ctx   = mp.get_context("spawn")
-        queue = ctx.Queue()
-        for row in pending:
-            queue.put(row)
-        for _ in range(n_workers):
-            queue.put(None)
-
-        procs = [
-            ctx.Process(target=_worker, args=(gpu_ids[i % len(gpu_ids)], i, queue))
-            for i in range(n_workers)
-        ]
-        for p in procs:
-            p.start()
-        for p in procs:
-            p.join()
-
-    # Consolidate all per-slab candidates.csv into one batch summary
+def _write_batch_summary() -> None:
+    """Reduce: consolidate all per-slab candidates.csv into one batch summary."""
     all_csvs = sorted(glob.glob(str(OUT_DIR / "*" / "candidates.csv")))
     frames = []
     for csv_path in all_csvs:
@@ -262,13 +176,55 @@ if __name__ == "__main__":
             master_log.warning(f"Skipping {csv_path}: {exc}")
 
     if frames:
-        summary      = pd.concat(frames, ignore_index=True)
+        summary = pd.concat(frames, ignore_index=True)
         summary_path = OUT_DIR / "batch_summary.csv"
-        summary.to_csv(summary_path, index=False)
+        write_atomic_csv(summary, summary_path)
         master_log.info(f"Saved consolidated results → {summary_path}")
-
         best = summary.loc[summary.groupby("slab_name")["E_ads_ml_eV"].idxmin(),
                            ["slab_name", "E_ads_ml_eV"]]
         master_log.info("Best ML adsorption energies per slab:\n" + best.to_string(index=False))
     else:
         master_log.info("No results to summarise yet.")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Screen H* sites on relaxed slabs (AdsorbML)")
+    parser.add_argument("--workers", type=int, default=None,
+                        help="Number of parallel workers (default: one per eligible GPU)")
+    parser.add_argument("--shard", type=str, default=None,
+                        help="Process a disjoint stride I/N of the pending slabs "
+                             "(default: from SLURM_ARRAY_TASK_ID, else the whole set).")
+    parser.add_argument("--summary-only", action="store_true",
+                        help="Skip screening; just (re)build batch_summary.csv from existing candidates.")
+    args = parser.parse_args()
+
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    log_path = str(OUT_DIR / f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+    setup_logging(log_path)
+    master_log.info(f"Log: {log_path}")
+
+    if args.summary_only:
+        _write_batch_summary()
+        return
+
+    df       = pd.read_csv(MANIFEST_CSV)
+    all_rows = sorted(df.to_dict("records"), key=lambda r: r["slab_name"])
+    pending  = [r for r in all_rows if not _is_done(r["slab_name"])]
+    shard    = get_shard(args.shard)
+    pending  = apply_shard(pending, shard)
+    master_log.info(
+        f"Total: {len(all_rows)}  |  shard {shard[0]}/{shard[1]}  |  "
+        f"Pending in this shard: {len(pending)}"
+    )
+
+    run_gpu_workers(pending, task_name="oc20", process_item=process_row, n_workers=args.workers)
+
+    if shard[1] == 1:
+        _write_batch_summary()
+    else:
+        master_log.info("Multi-shard run: batch_summary NOT written. Run "
+                        "`python scripts/adsorbml/2-run_adsorbml.py --summary-only` afterward (optional).")
+
+
+if __name__ == "__main__":
+    main()
