@@ -44,6 +44,10 @@ OUTPUT_CSV = DATA_OUTPUTS / "gpaw_h_adsorption_results_v2.csv"
 OUTPUT_JSON = DATA_OUTPUTS / "gpaw_h_adsorption_results_v2.json"
 ADSORBML_OUTPUT_CSV = DATA_OUTPUTS / "gpaw_adsorbml_results.csv"
 
+# ZPE+entropy correction for H* (matches scripts/adsorbml/3-extract_rank.py).
+# Cancels when comparing DFT vs ML ΔG_H, but kept for absolute placement.
+ENTROPY_CORRECTION = 0.24  # eV
+
 # Configuration
 GPAW_CONFIG = {
     'mode': 'lcao',          # Linear Combination of Atomic Orbitals (faster)
