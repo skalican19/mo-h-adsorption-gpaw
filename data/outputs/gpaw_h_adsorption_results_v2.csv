@@ -1,2 +1,0 @@
-formula,surface_facet,adsorbate,E_clean_slab_eV,E_slab_with_h_eV,E_h2_eV,ΔGH_eV,descriptor_eV,source,adsorption_site,h2_source,relaxed,status,timestamp
-graphene,sheet,H,-313.3585364135347,-313.8824941311638,-6.438412987227499,2.6952487759846333,2.6952487759846333,GPAW_LDA,top_4,computed,False,completed,2026-04-27T08:35:42.053361

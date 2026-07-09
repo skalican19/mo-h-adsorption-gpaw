@@ -1,7 +1,7 @@
 # CLAUDE.md — mo-h-adsorption-gpaw
 
 Repo summary for coding agents. Complements `README.md` (human quick-start) with
-the internal structure, pipelines, and conventions. Verified 2026-07-01; re-check
+the internal structure, pipelines, and conventions. Verified 2026-07-09; re-check
 against code before relying on specifics.
 
 ## What this is
@@ -46,8 +46,12 @@ requirements.txt              # ase, numpy, pandas, gpaw, pymatgen, fairchem-cor
 
 ## Key settings (in `scripts/gpaw_h_adsorption.py`, top of file)
 
-- `GPAW_CONFIG`: LCAO / DZP basis / **PBE** / kpts (4,4,1).
-- `RELAXATION_CONFIG`: fmax 0.10 eV/Å, 8 steps (coarse; overridable via `--fmax`/`--relax-steps`).
+- `GPAW_CONFIG`: **PW(350) plane waves** / **RPBE** / `kpts='auto'` (OC20 Monkhorst-Pack
+  density `round(40/|a|)` in-plane, 1 in z) / non-spin-polarized / Methfessel-Paxton
+  smearing 0.2 eV. Matches the OC20 (RPBE) VASP reference UMA's `oc20` head was trained on.
+  (Not comparable to the older LDA/PBE-LCAO ΔG_H CSVs.)
+- `RELAXATION_CONFIG`: fmax 0.03 eV/Å, 200 steps (overridable via `--fmax`/`--relax-steps`;
+  `--kpts` overrides the mesh). CLI overrides default to None → inherit these config values.
 - `ENTROPY_CORRECTION = 0.24 eV`; `CORES_PER_CALC = 11`; `RAM_PER_CALC_GB = 4`.
 - AdsorbML step constants live in `scripts/adsorbml/_common.py` (FMAX 0.02, MAX_STEPS 100,
   NUM_PLACEMENTS 100, UMA_MODEL "uma-m-1p1", same 0.24 correction).
@@ -98,8 +102,9 @@ arrays**:
 - Legacy VASP scripts (`compute_h_adsorption.py`, `parse_vasp_results.py`) are not the
   primary path; GPAW is.
 - Known data caveats and history are tracked in the agent memory dir (see MEMORY.md):
-  the LDA→PBE switch, Mo₂N (111) vacancy generation bug, and that the old gpaw ΔG_H CSV
-  is not trustworthy ground truth.
+  the LDA→PBE→RPBE/PW switch, the silent no-op vacancy/dopant + interface-overlap generator
+  bugs, wrong base polymorphs (MoP/Mo₂N/MoS₂), and that the old gpaw ΔG_H CSV is not
+  trustworthy ground truth.
 
 ## Status / direction (from README, 2026-02-11)
 

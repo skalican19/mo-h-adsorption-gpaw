@@ -7,7 +7,8 @@ Requirements:
 - ASE (comes with GPAW)
 
 Features:
-- 20-step BFGS relaxation for improved accuracy
+- BFGS relaxation (fmax 0.03 eV/Å, up to 200 steps) matching the OC20/RPBE reference
+- Plane-wave PW(350 eV) / RPBE with the OC20 Monkhorst-Pack k-mesh
 - Auto-detecting parallelism (scales to available CPU/RAM)
 - Incremental CSV writing (crash-safe)
 - Checkpoint/resume (skips already-completed entries)
@@ -29,7 +30,7 @@ from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed, TimeoutError
 from ase import Atoms
 from ase.io import read
-from gpaw import GPAW
+from gpaw import GPAW, PW
 from ase.optimize import BFGS
 from ase.constraints import FixAtoms
 from datetime import datetime
@@ -43,28 +44,41 @@ H2_REFERENCE_FILE = DATA_OUTPUTS / "h2_reference_energy.json"
 OUTPUT_CSV = DATA_OUTPUTS / "gpaw_h_adsorption_results_v2.csv"
 OUTPUT_JSON = DATA_OUTPUTS / "gpaw_h_adsorption_results_v2.json"
 ADSORBML_OUTPUT_CSV = DATA_OUTPUTS / "gpaw_adsorbml_results.csv"
+ADSORBML_OUTPUT_JSON = DATA_OUTPUTS / "gpaw_adsorbml_results.json"
 
 # ZPE+entropy correction for H* (matches scripts/adsorbml/3-extract_rank.py).
 # Cancels when comparing DFT vs ML ΔG_H, but kept for absolute placement.
 ENTROPY_CORRECTION = 0.24  # eV
 
 # Configuration
+# Matches the OC20 (RPBE) VASP reference that UMA's adsorption head
+# (task_name="oc20", used in scripts/adsorbml/2-run_adsorbml.py) was trained on.
+# Verified against the OC20 paper (arXiv:2010.09990) and the fairchem source
+# Open-Catalyst-Dataset/ocdata/utils/vasp.py (VASP_FLAGS):
+#   gga="RP" (RPBE), encut=350, ediffg=-0.03, no ISPIN (non-spin-polarized),
+#   no LDIPOL/IDIPOL (no dipole correction), no ISMEAR/SIGMA set → VASP defaults
+#   (Methfessel-Paxton order 1, sigma 0.2 eV), Monkhorst-Pack k-mesh round(40/|a|).
+# Irreducible gap: GPAW ships its own PAW datasets and cannot load VASP's, so a
+# residual ~tens-of-meV offset vs VASP remains.
 GPAW_CONFIG = {
-    'mode': 'lcao',          # Linear Combination of Atomic Orbitals (faster)
-    'basis': 'dzp',          # Double-zeta + polarization (good accuracy)
-    'xc': 'PBE',             # Exchange-correlation functional
-    'kpts': (4, 4, 1),       # K-point mesh for slab
+    'mode': 'pw',            # Plane waves (like VASP); replaces LCAO/DZP
+    'ecut': 350,             # eV, OC20 ENCUT=350
+    'xc': 'RPBE',            # OC20 gga="RP"
+    'kpts': 'auto',          # OC20 Monkhorst-Pack density (see _oc20_kpts)
+    'spinpol': False,        # OC20 is NOT spin-polarized (VASP ISPIN default 1)
+    # OC20 leaves ISMEAR/SIGMA at VASP defaults: Methfessel-Paxton order 1, 0.2 eV.
+    'smearing': {'name': 'methfessel-paxton', 'width': 0.2, 'order': 1},
     'txt': 'gpaw.txt',       # Output log file
     'convergence': {
-        'energy': 1e-5,      # Energy convergence (eV)
+        'energy': 1e-5,      # Energy convergence (eV) — tighter than OC20 EDIFF=1e-4
         'density': 1e-4,     # Electron density convergence
         'eigenstates': 1e-5, # Eigenstate convergence
     },
 }
 
 RELAXATION_CONFIG = {
-    'fmax': 0.10,            # Force convergence (eV/Å)
-    'steps': 8,              # Max geometry optimization steps
+    'fmax': 0.03,            # eV/Å, matches OC20 EDIFFG=-0.03 (was 0.10)
+    'steps': 200,            # practical cap; OC20 allowed NSW=2000 (was 8)
 }
 
 USE_RELAXATION = True
@@ -80,7 +94,7 @@ MAX_HOURS_PER_STRUCTURE = 0.0
 CSV_COLUMNS = [
     'formula', 'surface_facet', 'adsorbate',
     'E_clean_slab_eV', 'E_slab_with_h_eV', 'E_h2_eV',
-    'ΔGH_eV', 'descriptor_eV', 'source',
+    'E_ads_eV', 'ΔGH_eV', 'source',
     'adsorption_site', 'h2_source', 'relaxed',
     'status', 'timestamp',
 ]
@@ -178,6 +192,32 @@ def _load_completed_keys(csv_path):
     return completed
 
 
+def _make_row(formula, surface, *, e_clean=None, e_with_h=None, e_h2=None,
+              e_ads=None, dgh=None, source=None, site=None, h2_source=None,
+              relaxed=None, status='failed', timestamp=None):
+    """Assemble one result row in CSV_COLUMNS order.
+
+    `source` defaults to GPAW_<xc>; `relaxed` defaults to the current USE_RELAXATION;
+    `timestamp` defaults to now. AdsorbML callers append the extra ML column themselves.
+    """
+    return [
+        formula,
+        surface,
+        'H',
+        e_clean,
+        e_with_h,
+        e_h2,
+        e_ads,
+        dgh,
+        source if source is not None else f'GPAW_{GPAW_CONFIG["xc"]}',
+        site,
+        h2_source,
+        bool(USE_RELAXATION) if relaxed is None else relaxed,
+        status,
+        timestamp if timestamp is not None else datetime.now().isoformat(),
+    ]
+
+
 def discover_structures(base_dir, include_patterns=None):
     """Discover all POSCAR files under base_dir and return labels.
 
@@ -225,28 +265,47 @@ def filter_structures_by_name(structures, selected_names):
     return filtered
 
 
-def setup_gpaw_calculator(label='gpaw'):
+def setup_gpaw_calculator(label='gpaw', atoms=None):
     """
-    Create GPAW calculator with optimized settings
-    
+    Create GPAW calculator matching the OC20/RPBE VASP reference.
+
     Args:
         label: Label for calculation files
-        
+        atoms: Atoms object, required when kpts='auto' (OC20 per-cell k-mesh)
+
     Returns:
         GPAW calculator object
     """
+    kpts = GPAW_CONFIG['kpts']
+    if kpts == 'auto':
+        if atoms is None:
+            raise ValueError("kpts='auto' requires `atoms` to compute the OC20 k-mesh")
+        kpts = _oc20_kpts(atoms)
     return GPAW(
-        mode=GPAW_CONFIG['mode'],
-        basis=GPAW_CONFIG['basis'],
+        mode=PW(GPAW_CONFIG['ecut']),
         xc=GPAW_CONFIG['xc'],
-        kpts=GPAW_CONFIG['kpts'],
+        kpts=kpts,
+        spinpol=GPAW_CONFIG['spinpol'],
+        occupations=dict(GPAW_CONFIG['smearing']),
         txt=label + '.txt',
         convergence=GPAW_CONFIG['convergence'],
     )
 
 
+def _oc20_kpts(atoms):
+    """OC20 Monkhorst-Pack mesh: round(40/|a_i|) in-plane, 1 out-of-plane.
+
+    Matches Open-Catalyst-Dataset/ocdata/utils/vasp.py:calculate_surface_k_points
+    (multiplier 40, infinity-norm of the first two cell vectors).
+    """
+    cell = atoms.get_cell()
+    a = np.linalg.norm(cell[0], ord=np.inf)
+    b = np.linalg.norm(cell[1], ord=np.inf)
+    return (max(1, int(round(40 / a))), max(1, int(round(40 / b))), 1)
+
+
 def _prepare_slab(slab_file):
-    """Load slab and enforce minimum vacuum."""
+    """Load slab and enforce minimum vacuum (repeated-slab, 3D-periodic like OC20)."""
     slab = read(slab_file)
     if slab.cell[2, 2] < 10:
         slab.cell[2, 2] = 15
@@ -271,6 +330,22 @@ def _maybe_relax(atoms, label):
     optimizer = BFGS(atoms, logfile=f"{label}_relax.log")
     optimizer.run(fmax=RELAXATION_CONFIG['fmax'], steps=RELAXATION_CONFIG['steps'])
     return atoms
+
+
+def _slab_energy(atoms, label, relax):
+    """Attach a GPAW calculator to a copy of `atoms`, optionally relax, return energy (eV)."""
+    atoms = atoms.copy()
+    atoms.calc = setup_gpaw_calculator(label=label, atoms=atoms)
+    if relax:
+        atoms = _maybe_relax(atoms, label)
+    return atoms.get_potential_energy()
+
+
+def _delta_gh(e_with_h, e_clean, e_h2):
+    """Return (E_ads, ΔGH). E_ads is raw electronic; ΔGH adds the ZPE/entropy correction
+    so it is directly comparable to the ML gibbs_free_ml_eV (which also includes it)."""
+    e_ads = e_with_h - e_clean - 0.5 * e_h2
+    return e_ads, e_ads + ENTROPY_CORRECTION
 
 
 def _candidate_h_positions(slab, h_distance=1.5, max_sites=6):
@@ -323,20 +398,10 @@ def calculate_clean_slab_energy(slab, output_dir):
     
     try:
         print(f"  └─ Calculating clean slab energy...")
-        
-        slab = slab.copy()
-        
-        # Setup GPAW calculator
-        calc = setup_gpaw_calculator(label=f'{output_dir}/clean_slab')
-        slab.calc = calc
-        slab = _maybe_relax(slab, f'{output_dir}/clean_slab')
-        
-        # Get energy
-        energy = slab.get_potential_energy()
+        energy = _slab_energy(slab, f'{output_dir}/clean_slab', relax=USE_RELAXATION)
         print(f"     ✓ Clean slab: E = {energy:.6f} eV")
-        
         return energy
-    
+
     except Exception as e:
         print(f"     ✗ Error: {e}")
         return None
@@ -368,11 +433,8 @@ def calculate_slab_with_h_energy(slab, output_dir, h_distance=1.5):
             slab_with_h = slab.copy()
             slab_with_h += Atoms('H', positions=[h_pos])
 
-            calc = setup_gpaw_calculator(label=f'{output_dir}/slab_with_h_{site_label}')
-            slab_with_h.calc = calc
-            slab_with_h = _maybe_relax(slab_with_h, f'{output_dir}/slab_with_h_{site_label}')
-
-            energy = slab_with_h.get_potential_energy()
+            energy = _slab_energy(slab_with_h, f'{output_dir}/slab_with_h_{site_label}',
+                                  relax=USE_RELAXATION)
             print(f"     · site={site_label:<12} E = {energy:.6f} eV")
 
             if best_energy is None or energy < best_energy:
@@ -406,16 +468,19 @@ def calculate_h2_molecule_energy(output_dir):
         
         # Create H2 molecule in a large box
         h2 = Atoms('H2', positions=[[0, 0, 0], [0, 0, 0.75]])
-        
-        # Add vacuum
+
+        # Add vacuum; PW mode requires periodic boundary conditions
         h2.center(vacuum=10)
-        
-        # Setup GPAW with relaxed k-points (fewer k-points for molecule)
+        h2.pbc = True
+
+        # Setup GPAW at the same level of theory as the slabs. No dipole
+        # correction (H2 is non-polar and this is a box, not a slab); Γ-point only.
         calc = GPAW(
-            mode=GPAW_CONFIG['mode'],
-            basis=GPAW_CONFIG['basis'],
+            mode=PW(GPAW_CONFIG['ecut']),
             xc=GPAW_CONFIG['xc'],
-            kpts=(1, 1, 1),  # Only 1 k-point for isolated molecule
+            kpts=(1, 1, 1),  # Only 1 k-point (Γ) for isolated molecule
+            spinpol=GPAW_CONFIG['spinpol'],
+            occupations=dict(GPAW_CONFIG['smearing']),
             txt=f'{output_dir}/h2_molecule.txt',
             convergence=GPAW_CONFIG['convergence'],
         )
@@ -489,6 +554,7 @@ def calculate_surface_properties(formula, miller, slab_file, output_dir, e_h2, h
         'E_clean_slab': None,
         'E_slab_with_h': None,
         'E_h2': None,
+        'E_ads': None,
         'ΔGH': None,
         'adsorption_site': None,
         'h_position': None,
@@ -521,16 +587,17 @@ def calculate_surface_properties(formula, miller, slab_file, output_dir, e_h2, h
         
         result['E_h2'] = float(e_h2)
         
-        # Calculate ΔGH
-        # ΔGH = E(slab+H) - E(slab) - 0.5 * E(H2)
-        delta_gh = e_with_h - e_clean - 0.5 * e_h2
+        # Calculate E_ads (raw electronic) and ΔGH (free energy)
+        e_ads, delta_gh = _delta_gh(e_with_h, e_clean, e_h2)
+        result['E_ads'] = float(e_ads)
         result['ΔGH'] = float(delta_gh)
         result['status'] = 'completed'
-        
+
         print(f"\n  Results for {formula} {miller}:")
         print(f"    E(clean slab) = {e_clean:.6f} eV")
         print(f"    E(slab+H)     = {e_with_h:.6f} eV")
         print(f"    E(H₂)         = {e_h2:.6f} eV")
+        print(f"    E_ads         = {e_ads:.6f} eV")
         print(f"    ΔGH           = {delta_gh:.6f} eV ← KEY RESULT!")
         
         if -0.2 < delta_gh < 0.2:
@@ -546,22 +613,14 @@ def calculate_surface_properties(formula, miller, slab_file, output_dir, e_h2, h
         print(f"  ✗ Error: {e}")
 
     # Write result to CSV immediately
-    row = [
-        result['formula'],
-        result['surface'],
-        'H',
-        result['E_clean_slab'],
-        result['E_slab_with_h'],
-        result['E_h2'],
-        result['ΔGH'],
-        result['ΔGH'],  # descriptor_eV = ΔGH
-        f'GPAW_{GPAW_CONFIG["xc"]}',
-        result.get('adsorption_site'),
-        result.get('h2_source'),
-        result.get('relaxed'),
-        result['status'],
-        result['timestamp'],
-    ]
+    row = _make_row(
+        result['formula'], result['surface'],
+        e_clean=result['E_clean_slab'], e_with_h=result['E_slab_with_h'],
+        e_h2=result['E_h2'], e_ads=result['E_ads'], dgh=result['ΔGH'],
+        site=result.get('adsorption_site'), h2_source=result.get('h2_source'),
+        relaxed=result.get('relaxed'), status=result['status'],
+        timestamp=result['timestamp'],
+    )
     _append_result_csv(row, OUTPUT_CSV)
 
     return result
@@ -569,22 +628,7 @@ def calculate_surface_properties(formula, miller, slab_file, output_dir, e_h2, h
 
 def _write_failed_row(formula, surface, h2_source, reason):
     """Write a failed result row directly (used for timeout/worker failures)."""
-    row = [
-        formula,
-        surface,
-        'H',
-        None,
-        None,
-        None,
-        None,
-        None,
-        'GPAW_LDA',
-        None,
-        h2_source,
-        bool(USE_RELAXATION),
-        'failed',
-        datetime.now().isoformat(),
-    ]
+    row = _make_row(formula, surface, h2_source=h2_source, status='failed')
     _append_result_csv(row, OUTPUT_CSV)
     print(f"  ✗ Marked failed: {formula} {surface} ({reason})")
 
@@ -629,6 +673,37 @@ def _compute_one(args):
             signal.alarm(0)
 
 
+def _run_pool(pending, worker_fn, workers_override=None, label_fn=repr):
+    """Run `worker_fn` over `pending` args, sequentially or via ProcessPoolExecutor.
+
+    Honors the global shutdown flag and logs per-task exceptions using
+    `label_fn(args)`. Returns the list of worker return values.
+    """
+    max_workers = _detect_max_workers(override_workers=workers_override)
+    results = []
+
+    if max_workers <= 1:
+        for args in pending:
+            if _shutdown_requested:
+                print("⚠️  Shutdown: stopping before next task")
+                break
+            results.append(worker_fn(args))
+        return results
+
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        future_map = {executor.submit(worker_fn, args): args for args in pending}
+        for future in as_completed(future_map):
+            if _shutdown_requested:
+                print("⚠️  Shutdown: cancelling remaining futures")
+                executor.shutdown(wait=False, cancel_futures=True)
+                break
+            try:
+                results.append(future.result())
+            except Exception as exc:
+                print(f"  ✗ Worker exception for {label_fn(future_map[future])}: {exc}")
+    return results
+
+
 # ── AdsorbML mode ───────────────────────────────────────────────
 def _load_adsorbml_structures(csv_path):
     """Read ranked_candidates.csv and return list of dicts for _compute_one_adsorbml."""
@@ -658,36 +733,33 @@ def _compute_one_adsorbml(args):
 
     timestamp = datetime.now().isoformat()
     status = 'failed'
-    e_clean = e_with_h = dgh = None
+    e_clean = e_with_h = e_ads = dgh = None
 
     try:
         clean_slab = _prepare_slab(slab_file)
-        clean_slab.calc = setup_gpaw_calculator(label=f'{output_dir}/clean_slab')
-        e_clean = clean_slab.get_potential_energy()
+        e_clean = _slab_energy(clean_slab, f'{output_dir}/clean_slab', relax=False)
         print(f"     ✓ Clean slab: E = {e_clean:.6f} eV")
 
         adslab = _prepare_slab(adslab_file)
-        adslab.calc = setup_gpaw_calculator(label=f'{output_dir}/adslab')
-        e_with_h = adslab.get_potential_energy()
+        e_with_h = _slab_energy(adslab, f'{output_dir}/adslab', relax=False)
         print(f"     ✓ Adslab: E = {e_with_h:.6f} eV")
 
-        dgh = e_with_h - e_clean - 0.5 * e_h2
+        e_ads, dgh = _delta_gh(e_with_h, e_clean, e_h2)
         status = 'completed'
-        print(f"  ΔGH (DFT) = {dgh:.6f} eV   ML = {gibbs_ml:.4f} eV")
+        print(f"  E_ads (DFT) = {e_ads:.6f} eV   ΔGH (DFT) = {dgh:.6f} eV   ML ΔG*H = {gibbs_ml:.4f} eV")
 
     except Exception as exc:
         print(f"  ✗ Error: {exc}")
 
-    row_data = [
-        slab_name, slab_name, 'H',
-        e_clean, e_with_h, e_h2,
-        dgh, dgh, f'GPAW_{GPAW_CONFIG["xc"]}_adsorbml',
-        'adsorbml_best', h2_source, False,
-        status, timestamp, gibbs_ml,
-    ]
+    row_data = _make_row(
+        slab_name, slab_name,
+        e_clean=e_clean, e_with_h=e_with_h, e_h2=e_h2, e_ads=e_ads, dgh=dgh,
+        source=f'GPAW_{GPAW_CONFIG["xc"]}_adsorbml', site='adsorbml_best',
+        h2_source=h2_source, relaxed=False, status=status, timestamp=timestamp,
+    ) + [gibbs_ml]
     _append_result_csv(row_data, ADSORBML_OUTPUT_CSV)
     return {'formula': slab_name, 'surface': slab_name, 'status': status,
-            'ΔGH': dgh, 'gibbs_free_ml_eV': gibbs_ml, 'timestamp': timestamp}
+            'E_ads': e_ads, 'ΔGH': dgh, 'gibbs_free_ml_eV': gibbs_ml, 'timestamp': timestamp}
 
 
 def run_adsorbml_calculations(candidates_csv, workers_override=None, selected_names=None):
@@ -722,46 +794,23 @@ def run_adsorbml_calculations(candidates_csv, workers_override=None, selected_na
         print("✓ All structures already completed!")
         return []
 
-    max_workers = _detect_max_workers(override_workers=workers_override)
-    all_results = []
-
-    if max_workers <= 1:
-        for args in pending:
-            if _shutdown_requested:
-                break
-            all_results.append(_compute_one_adsorbml(args))
-    else:
-        with ProcessPoolExecutor(max_workers=max_workers) as executor:
-            future_map = {executor.submit(_compute_one_adsorbml, args): args for args in pending}
-            for future in as_completed(future_map):
-                if _shutdown_requested:
-                    executor.shutdown(wait=False, cancel_futures=True)
-                    break
-                try:
-                    all_results.append(future.result())
-                except Exception as exc:
-                    args = future_map[future]
-                    print(f"  ✗ Worker exception for {args[0]['slab_name']}: {exc}")
-
-    return all_results
+    return _run_pool(pending, _compute_one_adsorbml,
+                     workers_override=workers_override,
+                     label_fn=lambda a: a[0]['slab_name'])
 
 
-def run_calculations_parallel(formulas=['MoS2', 'MoSe2', 'MoP', 'Mo2N'],
-                             millers=['(100)', '(110)', '(111)'],
-                             base_dir=None,
-                             results_file=None,
-                             use_discovery=True,
+def run_calculations_parallel(base_dir=None,
                              include_patterns=None,
                              selected_structure_names=None,
                              workers_override=None,
                              max_hours_per_structure=None):
     """
-    Run all calculations with parallel workers and checkpoint/resume.
+    Discover POSCARs and run all calculations with parallel workers and checkpoint/resume.
 
     Args:
         include_patterns: optional list of glob patterns to filter structures
     """
-    
+
     print("\n" + "="*60)
     print("GPAW H Adsorption Energy Calculator (v2)")
     print("="*60)
@@ -783,80 +832,30 @@ def run_calculations_parallel(formulas=['MoS2', 'MoSe2', 'MoP', 'Mo2N'],
         print(f"✓ Checkpoint: {len(completed)} structures already completed, will skip")
 
     e_h2, h2_source = get_h2_reference_energy()
-    
-    all_results = []
-    
-    if use_discovery:
-        structures = discover_structures(base_dir, include_patterns=include_patterns)
-        structures = filter_structures_by_name(structures, selected_structure_names)
-        if not structures:
-            print("\n⚠️  No POSCAR files found in data/inputs/VASP_inputs")
-            return all_results
 
-        # Filter out already-completed
-        pending = []
-        max_seconds = 0
-        if max_hours_per_structure and max_hours_per_structure > 0:
-            max_seconds = int(max_hours_per_structure * 3600)
-        for formula, surface, poscar_dir in structures:
-            if (formula, surface) in completed:
-                continue
-            pending.append((formula, surface, poscar_dir, e_h2, h2_source, max_seconds))
+    structures = discover_structures(base_dir, include_patterns=include_patterns)
+    structures = filter_structures_by_name(structures, selected_structure_names)
+    if not structures:
+        print("\n⚠️  No POSCAR files found in data/inputs/VASP_inputs")
+        return []
 
-        print(f"Structures to compute: {len(pending)} (skipped {len(structures) - len(pending)} completed)")
+    max_seconds = 0
+    if max_hours_per_structure and max_hours_per_structure > 0:
+        max_seconds = int(max_hours_per_structure * 3600)
+    pending = [
+        (formula, surface, poscar_dir, e_h2, h2_source, max_seconds)
+        for formula, surface, poscar_dir in structures
+        if (formula, surface) not in completed
+    ]
 
-        if not pending:
-            print("✓ All structures already completed!")
-            return all_results
+    print(f"Structures to compute: {len(pending)} (skipped {len(structures) - len(pending)} completed)")
 
-        max_workers = _detect_max_workers(override_workers=workers_override)
+    if not pending:
+        print("✓ All structures already completed!")
+        return []
 
-        if max_workers <= 1:
-            # Sequential fallback
-            for args in pending:
-                if _shutdown_requested:
-                    print("⚠️  Shutdown: stopping before next structure")
-                    break
-                result = _compute_one(args)
-                all_results.append(result)
-        else:
-            with ProcessPoolExecutor(max_workers=max_workers) as executor:
-                future_map = {executor.submit(_compute_one, args): args for args in pending}
-
-                for future in as_completed(future_map):
-                    if _shutdown_requested:
-                        print("⚠️  Shutdown: cancelling remaining futures")
-                        executor.shutdown(wait=False, cancel_futures=True)
-                        break
-                    try:
-                        result = future.result()
-                        all_results.append(result)
-                    except Exception as exc:
-                        args = future_map[future]
-                        print(f"  ✗ Worker exception for {args[0]} {args[1]}: {exc}")
-    else:
-        for formula in formulas:
-            for miller in millers:
-                if _shutdown_requested:
-                    break
-                if (formula, miller) in completed:
-                    continue
-                dir_name = f"{formula}_{miller.replace('(', '').replace(')', '')}"
-                poscar_dir = Path(base_dir) / f"{formula}_{miller}"
-                poscar_file = poscar_dir / "POSCAR"
-                output_dir = GPAW_OUTPUTS / dir_name
-                
-                result = calculate_surface_properties(
-                    formula=formula,
-                    miller=miller,
-                    slab_file=str(poscar_file),
-                    output_dir=str(output_dir),
-                    e_h2=e_h2,
-                    h2_source=h2_source,
-                )
-                all_results.append(result)
-    
-    return all_results
+    return _run_pool(pending, _compute_one, workers_override=workers_override,
+                     label_fn=lambda a: f"{a[0]} {a[1]}")
 
 
 def save_results(results, json_file=None,
@@ -1093,12 +1092,19 @@ def main():
             with open(H2_REFERENCE_FILE, 'r') as f:
                 cache = json.load(f)
             cached_steps = cache.get('relaxation_steps')
-            cached_xc = cache.get('gpaw_config', {}).get('xc')
+            cached_cfg = cache.get('gpaw_config', {})
+            cached_xc = cached_cfg.get('xc')
+            cached_mode = cached_cfg.get('mode')
+            cached_ecut = cached_cfg.get('ecut')
             if cached_steps != RELAXATION_CONFIG['steps']:
                 print(f"⚠️  H2 cache mismatch (steps {cached_steps}→{RELAXATION_CONFIG['steps']}), recomputing")
                 H2_REFERENCE_FILE.unlink()
             elif cached_xc != GPAW_CONFIG['xc']:
                 print(f"⚠️  H2 cache mismatch (xc {cached_xc}→{GPAW_CONFIG['xc']}), recomputing")
+                H2_REFERENCE_FILE.unlink()
+            elif (cached_mode, cached_ecut) != (GPAW_CONFIG['mode'], GPAW_CONFIG['ecut']):
+                print(f"⚠️  H2 cache mismatch (mode/ecut {cached_mode}/{cached_ecut}→"
+                      f"{GPAW_CONFIG['mode']}/{GPAW_CONFIG['ecut']}), recomputing")
                 H2_REFERENCE_FILE.unlink()
         except Exception:
             pass
@@ -1113,9 +1119,10 @@ def main():
             workers_override=args.workers,
             selected_names=selected_structure_names,
         )
-        save_results(results, csv_file=ADSORBML_OUTPUT_CSV)
+        save_results(results, json_file=ADSORBML_OUTPUT_JSON, csv_file=ADSORBML_OUTPUT_CSV)
         print("\n✓ Done! AdsorbML DFT results saved to:")
-        print(f"  - {ADSORBML_OUTPUT_CSV}")
+        print(f"  - {ADSORBML_OUTPUT_CSV} (incremental, crash-safe)")
+        print(f"  - {ADSORBML_OUTPUT_JSON} (JSON summary)")
         return
 
     # ── Standard fresh-POSCAR mode ───────────────────────────────

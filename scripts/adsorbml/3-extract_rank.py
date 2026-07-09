@@ -131,10 +131,16 @@ def main():
                                        f"window [{args.emin}, {args.emax}])"))
             continue
 
-        # H atom is always the last atom in the adslab trajectory
+        # The adsorbate is a single H (*H); locate it by element rather than
+        # assuming it is the last atom. Take the last H if several are present.
         try:
             adslab = read(str(best["traj_path"]))
-            h_pos  = adslab[-1].position
+            h_idx = [i for i, a in enumerate(adslab) if a.symbol == "H"]
+            if not h_idx:
+                print(f"  WARN {slab_name}: no H atom in adslab; H position set to NaN")
+                h_pos = [float("nan")] * 3
+            else:
+                h_pos = adslab[h_idx[-1]].position
         except Exception as exc:
             print(f"  WARN {slab_name}: could not read H position: {exc}")
             h_pos = [float("nan")] * 3
