@@ -1,0 +1,5 @@
+{
+  "noble_metals": ["Pt", "Pd", "Ir", "Ru", "Ag", "Au"],
+  "base_matrix": "Ni",
+  "notes": "Shortlist from OCx24 for Ni/Mo composite dopants. Use for selecting single-atom dopants or nanoparticles in follow-up models."
+}

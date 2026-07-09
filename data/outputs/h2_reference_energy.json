@@ -1,0 +1,22 @@
+{
+  "E_h2_eV": -6.438412987227499,
+  "timestamp": "2026-04-27T08:35:42.042778",
+  "gpaw_config": {
+    "mode": "lcao",
+    "basis": "dzp",
+    "xc": "LDA",
+    "kpts": [
+      1,
+      1,
+      1
+    ],
+    "txt": "gpaw.txt",
+    "convergence": {
+      "energy": 1e-05,
+      "density": 0.0001,
+      "eigenstates": 1e-05
+    }
+  },
+  "relaxation_steps": 8,
+  "use_relaxation": false
+}

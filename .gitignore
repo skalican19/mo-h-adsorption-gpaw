@@ -2,9 +2,14 @@ __pycache__/
 *.pyc
 *.log
 .DS_Store
+nohup.out
 
 # GPAW heavy outputs
 /data/outputs/gpaw_calculations/
+
+# AdsorbML results and UMA-relaxed structures (kept locally, not in git)
+/data/adsorbml_results/
+/data/uma_relaxed/
 
 # Docs (keep locally, ignore in git)
 /docs/

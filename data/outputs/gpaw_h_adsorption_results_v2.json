@@ -1,0 +1,21 @@
+[
+  {
+    "formula": "graphene",
+    "surface": "sheet",
+    "timestamp": "2026-04-27T08:35:42.053361",
+    "status": "completed",
+    "E_clean_slab": -313.3585364135347,
+    "E_slab_with_h": -313.8824941311638,
+    "E_h2": -6.438412987227499,
+    "\u0394GH": 2.6952487759846333,
+    "adsorption_site": "top_4",
+    "h_position": [
+      0.0,
+      4.260844986619438,
+      11.5
+    ],
+    "h2_source": "computed",
+    "relaxed": false,
+    "error": null
+  }
+]
