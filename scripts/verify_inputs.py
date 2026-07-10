@@ -65,7 +65,11 @@ def out_of_box_fraction(atoms):
     angles = atoms.cell.angles()
     is_orthogonal = all(abs(a - 90.0) < 2.0 for a in angles)
     scaled = atoms.get_scaled_positions(wrap=False)
-    out = (scaled[:, :2] < -1e-6) | (scaled[:, :2] >= 1 + 1e-6)
+    # Margin of 0.1: atoms sitting a hair past the cell edge (|frac| ~0.02-0.05)
+    # are normal periodic-boundary wrapping, not the far-outside (frac ~0.5+)
+    # signature of the old concatenate-then-set_cell mismatched-glue bug.
+    margin = 0.1
+    out = (scaled[:, :2] < -margin) | (scaled[:, :2] >= 1 + margin)
     return float(np.mean(np.any(out, axis=1))), is_orthogonal
 
 
@@ -83,6 +87,74 @@ def differs_from_parent(child, parent):
 def find_parent_name(name):
     match = _DEFECT_SUFFIX_RE.match(name)
     return match.group("parent") if match else None
+
+
+# fcc Ni (a=3.52) interlayer spacing per facet -- lets the audit catch the
+# primitive-cell Miller degeneracy where "_(100)" silently became a Ni(111).
+_NI_FACET_SPACING = {"(100)": 3.52 / 2, "(111)": 3.52 / np.sqrt(3)}
+_MILLER_RE = re.compile(r"_(\([0-9]{3}\))")
+
+
+def _z_layers(z_values, tol=0.5):
+    zs = np.sort(np.asarray(z_values))
+    if len(zs) == 0:
+        return np.array([])
+    layers = [[zs[0]]]
+    for z in zs[1:]:
+        if z - layers[-1][-1] < tol:
+            layers[-1].append(z)
+        else:
+            layers.append([z])
+    return np.array([np.mean(l) for l in layers])
+
+
+def ni_facet_problem(name, atoms):
+    """For a Ni interface, check the Ni interlayer spacing matches the named facet."""
+    if "interface" not in name or "Ni" not in name:
+        return None
+    m = _MILLER_RE.search(name)
+    if not m or m.group(1) not in _NI_FACET_SPACING:
+        return None
+    expected = _NI_FACET_SPACING[m.group(1)]
+    z_ni = [a.position[2] for a in atoms if a.symbol == "Ni"]
+    layers = _z_layers(z_ni)
+    if len(layers) < 2:
+        return None
+    spacing = float(np.median(np.diff(layers)))
+    if abs(spacing - expected) > 0.15:
+        return (f"Ni interlayer spacing {spacing:.2f} A != {m.group(1)} facet "
+                f"(expected {expected:.2f} A) -- Miller degeneracy?")
+    return None
+
+
+def film_split_problem(name, atoms, max_internal_gap=3.0, max_cluster_atoms=4):
+    """For an interface, flag a film (non-Ni) sublattice split by a vacuum gap.
+
+    A deposited cluster ("_cluster{2,4}{El}") legitimately sits above the film,
+    creating a large gap to a *small* upper fragment; that is not a sliced sheet.
+    Only flag when the smaller fragment across the largest gap has more than
+    `max_cluster_atoms` atoms (a genuine orphaned atomic plane, like the old
+    MXene top-O slice), so supported clusters don't false-positive.
+    """
+    if "interface" not in name:
+        return None
+    z_film = np.sort([a.position[2] for a in atoms if a.symbol != "Ni"])
+    if len(z_film) < 2:
+        return None
+    # Gap between CONSECUTIVE ATOMS (not layer centroids): a thick continuous
+    # film has only small atom-to-atom gaps, so a real >max_internal_gap gap
+    # means the sheet is actually severed. (Centroid gaps falsely flag a thick
+    # film + a supported cluster.)
+    diffs = np.diff(z_film)
+    k = int(np.argmax(diffs))
+    gap = float(diffs[k])
+    if gap <= max_internal_gap:
+        return None
+    above = len(z_film) - (k + 1)   # atoms strictly above the gap
+    smaller = min(above, k + 1)
+    if smaller <= max_cluster_atoms:
+        return None  # deposited cluster / adatom above the film, not a sliced sheet
+    return f"film split by {gap:.1f} A gap into {k+1}+{above} atoms (sliced sheet / orphan layer)"
 
 
 def audit(base_dir, overlap_ratio_min=1.0, out_of_box_max=0.0):
@@ -117,6 +189,13 @@ def audit(base_dir, overlap_ratio_min=1.0, out_of_box_max=0.0):
                 problems.append(f"parent '{parent_name}' not found (cannot check for no-op)")
             elif not differs_from_parent(atoms, parent):
                 problems.append(f"identical to pristine parent '{parent_name}' (silent no-op)")
+
+        facet_problem = ni_facet_problem(name, atoms)
+        if facet_problem:
+            problems.append(facet_problem)
+        split_problem = film_split_problem(name, atoms)
+        if split_problem:
+            problems.append(split_problem)
 
         if problems:
             violations.append((name, problems))

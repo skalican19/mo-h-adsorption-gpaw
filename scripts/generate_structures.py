@@ -10,7 +10,7 @@ from pathlib import Path
 from ase import Atoms
 from ase.io import write
 from ase.constraints import FixAtoms
-from ase.build import bulk as ase_bulk, surface
+from ase.build import bulk as ase_bulk, surface, mx2, make_supercell
 from ase.neighborlist import neighbor_list
 from ase.data import covalent_radii
 import numpy as np
@@ -60,7 +60,77 @@ def _min_covalent_radius_ratio(atoms):
     return float(np.min(d / threshold))
 
 
+def _z_layers(z_values, tol=0.5):
+    """Collapse a 1-D array of z coordinates into sorted layer centroids."""
+    zs = np.sort(np.asarray(z_values))
+    layers = [[zs[0]]]
+    for z in zs[1:]:
+        if z - layers[-1][-1] < tol:
+            layers[-1].append(z)
+        else:
+            layers.append([z])
+    return np.array([np.mean(l) for l in layers])
+
+
+# fcc interlayer spacing d_hkl (Å) for a=3.52 Ni, per facet actually used.
+# (100) stacks every a/2; (111) every a/sqrt(3). A degenerate primitive-cell
+# Ni bulk made both Miller strings cut the same {111} planes -- this table lets
+# the substrate assert catch that regression by measuring the real spacing.
+_NI_FACET_SPACING = {(1, 0, 0): 3.52 / 2, (1, 1, 1): 3.52 / np.sqrt(3)}
+
+
+def _assert_substrate_facet(interface, symbol, miller, label):
+    """Raise if the substrate sublattice's interlayer spacing != the requested facet."""
+    expected = _NI_FACET_SPACING.get(tuple(miller))
+    if expected is None:
+        return  # facet not tabulated; skip rather than guess
+    z_sub = [a.position[2] for a in interface if a.symbol == symbol]
+    layers = _z_layers(z_sub)
+    if len(layers) < 2:
+        raise ValueError(f"{label}: <2 {symbol} layers, cannot verify {miller} facet")
+    spacing = float(np.median(np.diff(layers)))
+    if abs(spacing - expected) > 0.15:
+        raise ValueError(
+            f"{label}: {symbol} interlayer spacing {spacing:.2f} A does not match "
+            f"the requested {miller} facet (expected {expected:.2f} A) -- likely a "
+            f"primitive-cell Miller degeneracy (use cubic=True for the fcc bulk)"
+        )
+
+
+def _assert_film_integrity(interface, substrate_symbol, max_internal_gap, label):
+    """Raise if the film sublattice (non-substrate atoms) is split by a vacuum gap.
+
+    Catches the sliced-monolayer artifact where an interface builder cuts a 2-D
+    sheet mid-slab, leaving orphan atomic planes separated by >max_internal_gap.
+    """
+    z_film = [a.position[2] for a in interface if a.symbol != substrate_symbol]
+    if not z_film:
+        raise ValueError(f"{label}: no film atoms found")
+    layers = _z_layers(z_film)
+    gaps = np.diff(layers)
+    if len(gaps) and gaps.max() > max_internal_gap:
+        raise ValueError(
+            f"{label}: film is split by a {gaps.max():.1f} A internal vacuum gap "
+            f"(> {max_internal_gap} A) -- sheet was sliced, not kept intact"
+        )
+
+
 # ── Base bulk structures ─────────────────────────────────────────
+
+def create_tmd_monolayer(formula, a, thickness):
+    """Single 2H-MX2 monolayer in an ORTHOGONAL (rectangular) cell (2 f.u.).
+
+    Used for edge nanoribbons: the P6_3/mmc bulk has two S-Mo-S sheets per cell,
+    so repeating it made "edge" ribbons accidental bilayer rods. A true edge
+    model is one monolayer wide in z. The rectangular cell (a x a*sqrt(3)) has
+    orthogonal axes so a clean finite-in-x / periodic-in-y ribbon can be cut.
+    """
+    hexol = mx2(formula=formula, kind='2H', a=a, thickness=thickness,
+                size=(1, 1, 1), vacuum=7.5)
+    ortho = make_supercell(hexol, [[1, 0, 0], [1, 2, 0], [0, 0, 1]])
+    ortho.set_pbc([True, True, False])
+    return ortho
+
 
 def create_mos2_bulk():
     """2H-MoS2 bulk, P6_3/mmc (#194), two S-Mo-S layers per cell (mp-1018809)."""
@@ -134,74 +204,65 @@ def create_mo2n_bulk():
 
 
 def create_mo2c_bulk():
-    """Create Mo2C bulk structure (orthorhombic, Pbcn)."""
-    a, b, c = 4.732, 6.037, 5.204  # Å, experimental
+    """beta-Mo2C bulk, orthorhombic Pbcn (#60), xi-Fe2N-type (mp / ICSD, exp).
 
-    cell = np.array([
-        [a, 0, 0],
-        [0, b, 0],
-        [0, 0, c],
-    ])
-
-    # Pbcn Mo2C: 4 Mo + 2 C per unit cell (Wyckoff 8d Mo, 4c C)
-    symbols = ['Mo', 'Mo', 'Mo', 'Mo', 'C', 'C']
-    positions = np.array([
-        [0.25, 0.12, 0.08],
-        [0.75, 0.88, 0.92],
-        [0.25, 0.62, 0.42],
-        [0.75, 0.38, 0.58],
-        [0.0,  0.36, 0.25],
-        [0.5,  0.64, 0.75],
-    ])
-
-    atoms = Atoms(symbols, cell=cell, pbc=[True, True, True])
-    atoms.set_scaled_positions(positions)
+    12 atoms/cell (Mo8 C4): Mo on 8d, C on 4c. The previous 6-atom hand-typed
+    cell was HALF density (~4.6 vs ~9.2 g/cc) and reduced to P2_1, not Pbcn --
+    it was not beta-Mo2C at all. Coordinates from Christensen (1977) /
+    arXiv:2201.12706 Table 1; from_spacegroup expands the Wyckoff orbits so the
+    full 12-atom cell is generated correctly.
+    """
+    a, b, c = 4.725, 6.022, 5.195  # Å, experimental
+    lattice = Lattice.orthorhombic(a, b, c)
+    struct = Structure.from_spacegroup(
+        "Pbcn", lattice, ["Mo", "C"],
+        [[0.250, 0.125, 0.083], [0.500, 0.375, 0.250]],
+    )
+    atoms = AseAtomsAdaptor.get_atoms(struct)
+    atoms.set_pbc([True, True, True])
+    # Each C sits in an octahedron of 6 Mo; each Mo has 3 near-planar C.
+    _assert_coordination(atoms, "C", "Mo", cutoff=2.4, expected=6, label="Mo2C bulk (C-Mo)")
+    _assert_coordination(atoms, "Mo", "C", cutoff=2.4, expected=3, label="Mo2C bulk (Mo-C)")
     return atoms
 
 
 def create_mob_bulk():
-    """Create MoB bulk structure (tetragonal, I4_1/amd)."""
-    a = 3.110  # Å
-    c = 16.950  # Å
+    """alpha-MoB bulk, tetragonal I4_1/amd (#141), Bg / CrB-type.
 
-    cell = np.array([
-        [a, 0, 0],
-        [0, a, 0],
-        [0, 0, c],
-    ])
-
-    # I4_1/amd MoB: 8 Mo + 8 B per conventional cell
-    symbols = ['Mo'] * 8 + ['B'] * 8
-    positions = np.array([
-        # Mo 8e positions
-        [0.0,  0.0,  0.197],
-        [0.5,  0.5,  0.447],
-        [0.0,  0.5,  0.697],
-        [0.5,  0.0,  0.947],
-        [0.0,  0.0,  0.803],
-        [0.5,  0.5,  0.553],
-        [0.0,  0.5,  0.303],
-        [0.5,  0.0,  0.053],
-        # B 8e positions
-        [0.0,  0.0,  0.348],
-        [0.5,  0.5,  0.598],
-        [0.0,  0.5,  0.848],
-        [0.5,  0.0,  0.098],
-        [0.0,  0.0,  0.652],
-        [0.5,  0.5,  0.402],
-        [0.0,  0.5,  0.152],
-        [0.5,  0.0,  0.902],
-    ])
-
-    atoms = Atoms(symbols, cell=cell, pbc=[True, True, True])
-    atoms.set_scaled_positions(positions)
+    Kiessling (1947), COD 9008953 / ICSD 24280: Mo and B both on 8e,
+    z(Mo)=0.197, z(B)=0.352, a=3.105, c=16.97. Boron forms zigzag chains
+    (each B has 2 in-chain B neighbours ~1.74 Å); each B sits in a
+    trigonal-prismatic Mo cage. The previous hand-typed "8e" list did not lie
+    on a valid I4_1/amd orbit and produced 0.76 Å Mo-B overlaps (detected SG
+    Cmmm) -- from_spacegroup generates the correct orbit instead.
+    """
+    a, c = 3.105, 16.97  # Å, experimental
+    lattice = Lattice.tetragonal(a, c)
+    struct = Structure.from_spacegroup(
+        "I4_1/amd", lattice, ["Mo", "B"], [[0, 0, 0.197], [0, 0, 0.352]]
+    )
+    atoms = AseAtomsAdaptor.get_atoms(struct)
+    atoms.set_pbc([True, True, True])
+    _assert_coordination(atoms, "B", "B", cutoff=2.0, expected=2, label="MoB bulk (B-B chain)")
+    _assert_coordination(atoms, "B", "Mo", cutoff=2.7, expected=7, label="MoB bulk (B-Mo cage)")
     return atoms
 
 
 def create_ti3c2_bulk():
-    """Create Ti3C2 MXene bulk structure (hexagonal, O-terminated: Ti3C2O2)."""
-    a = 3.071  # Å
-    c = 20.0   # Å (large c for layered structure with vacuum)
+    """Ti3C2O2 MXene as a COMPACT vdW-stacked hexagonal cell (O-terminated).
+
+    Seven close-packed sub-layers O-Ti-C-Ti-C-Ti-O (~1.0 Å apart, ~6 Å thick)
+    plus a ~3 Å van-der-Waals gap, so c ≈ 9 Å is a real periodic stack -- NOT a
+    monolayer floating in 20 Å of vacuum. The old vacuum-cell version made
+    SlabGenerator/CoherentInterfaceBuilder treat the whole 20 Å as bulk and
+    slice the sheet mid-monolayer; a compact cell puts the (001) cut in the gap
+    and yields one intact sheet with film_thickness=1.
+    """
+    a = 3.071          # Å, in-plane
+    sub_dz = 1.0       # Å between close-packed sub-layers
+    gap = 3.0          # Å van-der-Waals gap between stacked sheets
+    thickness = 6 * sub_dz            # O-to-O sheet thickness
+    c = thickness + gap
 
     cell = np.array([
         [a, 0, 0],
@@ -209,18 +270,13 @@ def create_ti3c2_bulk():
         [0, 0, c],
     ])
 
-    # Ti3C2O2 monolayer centred in cell
+    z0 = 0.0                           # sheet contiguous from the origin; gap sits at the top
+    #                                    of the cell (not straddling the boundary), so a
+    #                                    film_thickness=1 cut keeps all 7 sub-layers together
     symbols = ['O', 'Ti', 'C', 'Ti', 'C', 'Ti', 'O']
-    # z positions in fractional coords, symmetric about 0.5
-    positions = np.array([
-        [1 / 3, 2 / 3, 0.350],  # O bottom
-        [2 / 3, 1 / 3, 0.400],  # Ti bottom
-        [0.0,   0.0,   0.450],  # C bottom
-        [1 / 3, 2 / 3, 0.500],  # Ti middle
-        [2 / 3, 1 / 3, 0.550],  # C top
-        [0.0,   0.0,   0.600],  # Ti top
-        [1 / 3, 2 / 3, 0.650],  # O top
-    ])
+    xy = [(1 / 3, 2 / 3), (2 / 3, 1 / 3), (0.0, 0.0), (1 / 3, 2 / 3),
+          (2 / 3, 1 / 3), (0.0, 0.0), (1 / 3, 2 / 3)]
+    positions = np.array([[x, y, (z0 + i * sub_dz) / c] for i, (x, y) in enumerate(xy)])
 
     atoms = Atoms(symbols, cell=cell, pbc=[True, True, True])
     atoms.set_scaled_positions(positions)
@@ -307,41 +363,65 @@ def create_slab(bulk_atoms, miller="(100)", size=(2, 2, 4), vacuum=8):
     return slab
 
 
-def create_edge_ribbon(bulk_atoms, width=6, length=2, vacuum=8, edge_type="Mo"):
-    """Create a simple edge ribbon by adding vacuum in x and z.
+def create_edge_ribbon(bulk_atoms, width=6, length=2, vacuum=8, edge_type="Mo",
+                       layers_z=2, edge_depth=1.7, keep_fraction=0.0):
+    """Create an edge ribbon: finite in x (two edges), periodic in y, vacuum in x+z.
 
-    edge_type:
-        "Mo"  -> remove chalcogen atoms at ribbon edges
-        "X"   -> remove Mo atoms at ribbon edges (X = S or Se)
+    The removal species is derived from the actual composition (not a hard-coded
+    {S,Se,P} set, which made Mo2C/MoB "_edge_Mo" a silent no-op):
+        "Mo" -> remove anion atoms in the edge region, exposing a Mo edge;
+                `keep_fraction` of those edge anions are retained instead of
+                removed (0.5 -> ~50%-S-covered Mo edge, the HER-active model).
+        "X"  -> remove Mo in the edge region, exposing an anion edge.
+
+    Raises if the removal set is empty (no silent no-op). `layers_z` >= 2 makes
+    the 3-D carbide/nitride/boride "edges" a genuine nanorod rather than a
+    single-cell sliver; TMD monolayer ribbons pass layers_z=1.
+
+    NOTE: `keep_fraction` thins the edge anions to an approximate coverage by a
+    deterministic every-other rule; it is a reasonable partial-coverage edge
+    approximation, not a rigorously reconstructed literature edge (exact
+    monomer/dimer arrangement is not claimed).
     """
-    ribbon = bulk_atoms.repeat((width, length, 1))
-
-    # Create vacuum in x and z to form edges and a single-layer ribbon
+    metal = "Mo"
+    ribbon = bulk_atoms.repeat((width, length, layers_z))
     ribbon.center(vacuum=vacuum, axis=0)
     ribbon.center(vacuum=vacuum, axis=2)
     ribbon.set_pbc([False, True, False])
 
-    # Determine edge atoms by x position
-    positions = ribbon.get_positions()
-    x_positions = positions[:, 0]
-    x_min = np.min(x_positions)
-    x_max = np.max(x_positions)
-    tol = 0.3  # Angstroms
-    edge_mask = (x_positions - x_min < tol) | (x_max - x_positions < tol)
-
-    # Remove atoms at edges to approximate termination
+    symbols = ribbon.get_chemical_symbols()
+    anions = sorted({s for s in symbols if s != metal})
     if edge_type == "Mo":
-        remove_symbols = {"S", "Se", "P"}
+        remove_species = set(anions)
     else:
-        remove_symbols = {"Mo"}
+        if not anions:
+            raise ValueError(f"edge_type={edge_type}: no anion species to expose")
+        remove_species = {metal}
 
-    remove_indices = [
-        i for i, atom in enumerate(ribbon)
-        if edge_mask[i] and atom.symbol in remove_symbols
-    ]
-    if remove_indices:
-        del ribbon[remove_indices]
+    pos = ribbon.get_positions()
+    x = pos[:, 0]
+    x_min, x_max = x.min(), x.max()
+    edge_mask = (x - x_min < edge_depth) | (x_max - x < edge_depth)
+    candidates = [i for i, s in enumerate(symbols) if edge_mask[i] and s in remove_species]
+    if not candidates:
+        raise ValueError(
+            f"{edge_type}-edge: no {remove_species} atoms within {edge_depth} A of "
+            f"either x-edge to remove; refusing a silent no-op"
+        )
 
+    # Retain keep_fraction of the edge anions (Mo-edge coverage control), chosen
+    # deterministically by (x, y) so reruns are byte-identical.
+    if keep_fraction > 0.0:
+        ordered = sorted(candidates, key=lambda i: (round(x[i], 3), round(pos[i, 1], 3)))
+        step = max(1, round(1.0 / keep_fraction))
+        keep = set(ordered[::step])
+        remove = [i for i in candidates if i not in keep]
+    else:
+        remove = candidates
+    if not remove:
+        raise ValueError(f"{edge_type}-edge: keep_fraction={keep_fraction} left nothing to remove")
+
+    del ribbon[remove]
     _apply_constraints(ribbon)
     return ribbon
 
@@ -469,13 +549,16 @@ def add_cluster_on_surface(slab, element, n_atoms=2, height=1.8, spacing=2.4):
 
 
 def _build_zsl_interface(substrate_atoms, film_atoms, substrate_miller, film_miller,
-                          separation=2.2, vacuum=8.0, strain_tol=0.02,
-                          substrate_thickness=4, film_thickness=2):
+                          separation=2.2, vacuum=15.0, strain_tol=0.02,
+                          substrate_thickness=4, film_thickness=2, max_atoms=None):
     """Lattice-match a substrate/film pair with pymatgen ZSL and return a combined ASE slab.
 
     Replaces the old concatenate-then-set_cell(substrate.cell) approach, which never
     lattice-matched the two in-plane periodicities and wrapped mismatched atoms on
     top of each other (0.22-0.92 A overlaps).
+
+    `max_atoms`, if set, rejects coincidence cells above that size (GPAW
+    feasibility); the smallest-strain match that also fits is returned.
     """
     substrate_struct = AseAtomsAdaptor.get_structure(substrate_atoms)
     film_struct = AseAtomsAdaptor.get_structure(film_atoms)
@@ -504,9 +587,13 @@ def _build_zsl_interface(substrate_atoms, film_atoms, substrate_miller, film_mil
     # sane structure -- SlabGenerator's own primitive-cell/supercell reduction
     # can still produce a short in-plane contact within the film or substrate
     # sublattice. Reject those explicitly instead of trusting strain alone.
+    too_big = 0
     for strain, interface, termination in candidates:
         atoms = AseAtomsAdaptor.get_atoms(interface)
         atoms.set_pbc([True, True, False])
+        if max_atoms is not None and len(atoms) > max_atoms:
+            too_big += 1
+            continue
         if _min_covalent_radius_ratio(atoms) >= 1.0:
             print(f"[ZSL termination={termination} strain={strain:.3%} natoms={len(atoms)}] ", end="")
             return atoms
@@ -517,6 +604,13 @@ def _build_zsl_interface(substrate_atoms, film_atoms, substrate_miller, film_mil
             f"substrate_miller={substrate_miller}, film_miller={film_miller} "
             f"(mismatched lattices; refusing to emit an overlapping structure)"
         )
+    if too_big and too_big == len(candidates):
+        raise ValueError(
+            f"All {len(candidates)} ZSL match(es) within {strain_tol:.1%} strain for "
+            f"substrate_miller={substrate_miller}, film_miller={film_miller} exceed the "
+            f"{max_atoms}-atom cap (smallest-strain match still too large); "
+            f"too big for GPAW"
+        )
     raise ValueError(
         f"All {len(candidates)} ZSL match(es) within {strain_tol:.1%} strain for "
         f"substrate_miller={substrate_miller}, film_miller={film_miller} have a "
@@ -525,33 +619,52 @@ def _build_zsl_interface(substrate_atoms, film_atoms, substrate_miller, film_mil
     )
 
 
-def create_ni_mox_interface(mox_bulk_builder, miller="(111)", separation=2.2, strain_tol=0.02):
-    """Create a Ni/MoX interface slab via ZSL lattice matching (MoX film on Ni substrate)."""
+def create_ni_mox_interface(mox_bulk_builder, miller="(111)", separation=2.2, strain_tol=0.02,
+                            film_miller=None):
+    """Create a Ni/MoX interface slab via ZSL lattice matching (MoX film on Ni substrate).
+
+    `film_miller` defaults to the same facet as the Ni substrate; pass an
+    explicit tuple to cut the film on a fixed plane (e.g. the basal (001) of a
+    layered vdW crystal) while `miller` still selects only the Ni facet.
+    """
     indices = _parse_miller(miller)
-    ni_bulk = ase_bulk("Ni", "fcc", a=3.52)
+    # cubic=True: the primitive fcc cell makes Miller (100) and (111) cut the
+    # SAME conventional {111} planes -- a degeneracy that silently gave every
+    # "_(100)" interface a Ni(111) substrate. The conventional 4-atom cell
+    # interprets Miller indices in the cubic basis as intended.
+    ni_bulk = ase_bulk("Ni", "fcc", a=3.52, cubic=True)
     mox_bulk = mox_bulk_builder()
+    film_idx = indices if film_miller is None else tuple(film_miller)
     interface = _build_zsl_interface(
-        ni_bulk, mox_bulk, substrate_miller=indices, film_miller=indices,
+        ni_bulk, mox_bulk, substrate_miller=indices, film_miller=film_idx,
         separation=separation, strain_tol=strain_tol,
     )
+    _assert_substrate_facet(interface, "Ni", indices, label=f"Ni/MoX {miller}")
     _freeze_substrate_bottom_half(interface, substrate_symbol="Ni")
     return interface
 
 
-def create_ni_mxene_interface(miller="(111)", separation=2.2, strain_tol=0.02):
+def create_ni_mxene_interface(miller="(111)", separation=2.2, strain_tol=0.03, max_atoms=350):
     """Create a Ni/Ti3C2O2 MXene interface via ZSL lattice matching.
 
-    The MXene film is always cut at its own basal (0001) plane (the only
-    physically sensible facet of a single 2D sheet); `miller` only selects
-    the Ni substrate facet.
+    The MXene film is always cut at its own basal (001) plane (the only
+    physically sensible facet of a single 2D sheet), one sheet thick; `miller`
+    only selects the Ni substrate facet. Strain tol is relaxed to 3% and a
+    350-atom cap applied so a GPAW-feasible coincidence cell can win; if none
+    fits, _build_zsl_interface raises and the caller records it UMA-only.
     """
-    ni_bulk = ase_bulk("Ni", "fcc", a=3.52)
+    ni_bulk = ase_bulk("Ni", "fcc", a=3.52, cubic=True)
     mxene_bulk = create_ti3c2_bulk()
     indices = _parse_miller(miller)
     interface = _build_zsl_interface(
         ni_bulk, mxene_bulk, substrate_miller=indices, film_miller=(0, 0, 1),
-        separation=separation, strain_tol=strain_tol,
+        separation=separation, strain_tol=strain_tol, film_thickness=1,
+        max_atoms=max_atoms,
     )
+    _assert_substrate_facet(interface, "Ni", indices, label=f"Ni/MXene {miller}")
+    # One intact O-Ti-C-Ti-C-Ti-O sheet: no >3 Å gap within the film sublattice.
+    _assert_film_integrity(interface, substrate_symbol="Ni", max_internal_gap=3.0,
+                           label=f"Ni/MXene {miller}")
     _freeze_substrate_bottom_half(interface, substrate_symbol="Ni")
     return interface
 
@@ -596,7 +709,8 @@ def create_graphene_nanoribbon(width=6, length=3, vacuum=8):
     return ribbon
 
 
-def create_interface_with_dopant_generic(mox_bulk_builder, miller, dopant, target_symbol="Mo"):
+def create_interface_with_dopant_generic(mox_bulk_builder, miller, dopant, target_symbol="Mo",
+                                         film_miller=None):
     """Create Ni/MoX interface with a single dopant on the exposed MoX top layer.
 
     Targets the topmost Mo (the exposed catalytic surface; MoX sits on top of
@@ -604,14 +718,15 @@ def create_interface_with_dopant_generic(mox_bulk_builder, miller, dopant, targe
     (no surface Mo), create_substitution_slab raises instead of doping a
     buried atom.
     """
-    interface = create_ni_mox_interface(mox_bulk_builder, miller=miller)
+    interface = create_ni_mox_interface(mox_bulk_builder, miller=miller, film_miller=film_miller)
     interface = create_substitution_slab(interface, target_symbol, dopant)
     return interface
 
 
-def create_interface_with_cluster_generic(mox_bulk_builder, miller, dopant, cluster_size):
+def create_interface_with_cluster_generic(mox_bulk_builder, miller, dopant, cluster_size,
+                                          film_miller=None):
     """Create Ni/MoX interface with a small dopant cluster on surface."""
-    interface = create_ni_mox_interface(mox_bulk_builder, miller=miller)
+    interface = create_ni_mox_interface(mox_bulk_builder, miller=miller, film_miller=film_miller)
     interface = add_cluster_on_surface(interface, dopant, n_atoms=cluster_size)
     return interface
 
@@ -636,6 +751,12 @@ FACETS = {
 # In-plane supercell for defect/dopant slabs (dilutes the defect vs. its
 # periodic images; ~1/9 coverage instead of the old 1/4 from a 2x2 cell).
 DEFECT_SIZE = (3, 3, 4)
+
+# 2H-TMD monolayer params for edge ribbons: (in-plane a, S-S vertical thickness) Å.
+TMD_PARAMS = {
+    'MoS2':  (3.160, 3.19),
+    'MoSe2': (3.289, 3.34),
+}
 
 
 def generate_all_structures(include_glob=None, out_dir=None, list_only=False, dry_run=False):
@@ -676,12 +797,16 @@ def generate_all_structures(include_glob=None, out_dir=None, list_only=False, dr
         'MoB':  {'metal': 'Mo', 'anion': 'B'},
     }
 
-    # Systems that get Ni/MoX interface treatment
+    # Systems that get Ni/MoX interface treatment. `film_miller=None` cuts the
+    # film on the same facet as the Ni substrate (fine for the 3-D carbides/
+    # nitride/boride); MoS2 is a vdW crystal, so its film is always cut on the
+    # basal (001) plane -- cutting through (111)/(100) would sever covalent
+    # S-Mo-S bonds and expose a non-physical broken-bond termination.
     interface_systems = {
-        'Ni_Mo2N': create_mo2n_bulk,
-        'Ni_Mo2C': create_mo2c_bulk,
-        'Ni_MoB':  create_mob_bulk,
-        'Ni_MoS2': create_mos2_bulk,
+        'Ni_Mo2N': {'builder': create_mo2n_bulk, 'film_miller': None},
+        'Ni_Mo2C': {'builder': create_mo2c_bulk, 'film_miller': None},
+        'Ni_MoB':  {'builder': create_mob_bulk,  'film_miller': None},
+        'Ni_MoS2': {'builder': create_mos2_bulk, 'film_miller': (0, 0, 1)},
     }
 
     dopants = ["Pt", "Pd", "Ir", "Ru", "Ag", "Au", "Ni"]
@@ -732,12 +857,21 @@ def generate_all_structures(include_glob=None, out_dir=None, list_only=False, dr
             write_structure(f"{formula}_{miller}_sheet",
                 lambda m=miller: create_slab(bulk.copy(), miller=m, size=(4, 4, 4), vacuum=10))
 
-        # Edge ribbons (S-deficient Mo-edge, the literature HER-active site)
-        for edge_type, label in [("Mo", "Mo"), ("X", vac_sym)]:
+        # Edge ribbons cut from a single MONOLAYER (layers_z=1), not the 2-sheet
+        # bulk -- the old ribbons were accidental bilayer rods. Mo-edge and
+        # X(=S/Se)-edge are the two zigzag terminations; the Mo-edge is the
+        # literature HER-active site.
+        tmd_a, tmd_t = TMD_PARAMS[formula]
+        mono = create_tmd_monolayer(formula, a=tmd_a, thickness=tmd_t)
+        # Mo-edge kept at ~50% anion coverage (HER-active reconstruction);
+        # anion-edge is the bare chalcogen termination.
+        for edge_type, label, kf in [("Mo", "Mo", 0.5), ("X", vac_sym, 0.0)]:
             write_structure(f"{formula}_edge_{label}",
-                lambda et=edge_type: create_edge_ribbon(bulk.copy(), edge_type=et))
+                lambda et=edge_type, m=mono, k=kf: create_edge_ribbon(
+                    m.copy(), edge_type=et, layers_z=1, keep_fraction=k))
             write_structure(f"{formula}_edge_{label}_large",
-                lambda et=edge_type: create_edge_ribbon(bulk.copy(), width=10, length=3, edge_type=et))
+                lambda et=edge_type, m=mono, k=kf: create_edge_ribbon(
+                    m.copy(), width=10, length=3, edge_type=et, layers_z=1, keep_fraction=k))
 
     # ── Part 2.5: MoP basal + prismatic edge ─────────────────────
     print("\nMoP edges:")
@@ -793,35 +927,38 @@ def generate_all_structures(include_glob=None, out_dir=None, list_only=False, dr
                     lambda m=miller: create_slab(bulk.copy(), miller=m, size=(4, 4, 4), vacuum=10))
 
     # ── Part 4: Ni/MoX interfaces ────────────────────────────────
-    for sys_name, mox_builder in interface_systems.items():
+    for sys_name, info in interface_systems.items():
         print(f"\n{sys_name} interfaces:")
+        mox_builder = info['builder']
+        fm = info['film_miller']
 
         for miller in interface_millers:
             # Pristine interface
             write_structure(f"{sys_name}_interface_{miller}",
-                lambda m=miller, b=mox_builder: create_ni_mox_interface(b, miller=m))
+                lambda m=miller, b=mox_builder, f=fm: create_ni_mox_interface(b, miller=m, film_miller=f))
 
             # Single-atom dopants on the exposed MoX top layer
             for dopant in dopants:
                 write_structure(f"{sys_name}_interface_{miller}_dop{dopant}",
-                    lambda m=miller, b=mox_builder, d=dopant:
-                        create_interface_with_dopant_generic(b, m, d))
+                    lambda m=miller, b=mox_builder, d=dopant, f=fm:
+                        create_interface_with_dopant_generic(b, m, d, film_miller=f))
 
             # Noble metal clusters (2 and 4 atoms)
             for dec in decorations:
                 for cs in [2, 4]:
                     write_structure(f"{sys_name}_interface_{miller}_cluster{cs}{dec}",
-                        lambda m=miller, b=mox_builder, d=dec, s=cs:
-                            create_interface_with_cluster_generic(b, m, d, s))
+                        lambda m=miller, b=mox_builder, d=dec, s=cs, f=fm:
+                            create_interface_with_cluster_generic(b, m, d, s, film_miller=f))
 
     # ── Part 5: MXene Ti3C2 + Ni ─────────────────────────────────
     print("\nNi/MXene Ti3C2:")
 
-    # Bare MXene slabs
+    # Bare MXene slab: only the basal (001) monolayer is physical. Non-basal
+    # cuts of a single-sheet vdW cell are ribbon-stack artifacts (40 Å in-plane
+    # vacuum), so only (001) with a single sheet (size z=1) is emitted.
     mxene_bulk = create_ti3c2_bulk()
-    for miller in DEFAULT_MILLERS:
-        write_structure(f"Ti3C2O2_{miller}",
-            lambda m=miller: create_slab(mxene_bulk.copy(), miller=m))
+    write_structure("Ti3C2O2_(001)",
+        lambda: create_slab(mxene_bulk.copy(), miller="(001)", size=(3, 3, 1), vacuum=10))
 
     # Ni/MXene interfaces
     for miller in interface_millers:
@@ -887,6 +1024,15 @@ def _write_structure(base_dir, name, builder_fn, include_glob=None,
     print(f"    {name}: ", end="", flush=True)
     try:
         slab = builder_fn()
+        # Global overlap gate: every emitted structure -- not just interfaces --
+        # must be free of sub-covalent-radius contacts. This is the single choke
+        # point that would have caught the 0.76 A MoB overlaps at write time.
+        ratio = _min_covalent_radius_ratio(slab)
+        if ratio < 1.0:
+            raise ValueError(
+                f"atom overlap: min covalent-radius ratio {ratio:.2f} < 1.0 "
+                f"(some pair closer than a physical bond)"
+            )
         if dry_run:
             print(f"✓ (dry-run, {len(slab)} atoms, not written)")
             return
