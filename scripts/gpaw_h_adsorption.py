@@ -52,7 +52,8 @@ ENTROPY_CORRECTION = 0.24  # eV
 
 # Configuration
 # Matches the OC20 (RPBE) VASP reference that UMA's adsorption head
-# (task_name="oc20", used in scripts/adsorbml/2-run_adsorbml.py) was trained on.
+# (task_name="oc20", used in scripts/adsorbml/2-run_adsorbml.py) was trained on,
+# EXCEPT for the dipole correction below.
 # Verified against the OC20 paper (arXiv:2010.09990) and the fairchem source
 # Open-Catalyst-Dataset/ocdata/utils/vasp.py (VASP_FLAGS):
 #   gga="RP" (RPBE), encut=350, ediffg=-0.03, no ISPIN (non-spin-polarized),
@@ -60,6 +61,16 @@ ENTROPY_CORRECTION = 0.24  # eV
 #   (Methfessel-Paxton order 1, sigma 0.2 eV), Monkhorst-Pack k-mesh round(40/|a|).
 # Irreducible gap: GPAW ships its own PAW datasets and cannot load VASP's, so a
 # residual ~tens-of-meV offset vs VASP remains.
+#
+# Dipole correction: our slabs are asymmetric (frozen bottom half; defects/
+# dopants/clusters on one face only), so without a dipole correction a
+# spurious field crosses the periodic cell and biases ΔG_H -- worst on polar
+# terminations (e.g. any pure-Mo Mo2N facet). This deliberately breaks exact
+# OC20 config-matching (UMA's oc20 head was trained with no LDIPOL/IDIPOL), so
+# gibbs_free_ml_eV (UMA) vs GPAW ΔG_H comparisons in the AdsorbML re-check will
+# show a systematic offset going forward -- physics-correctness was chosen
+# over ML/DFT comparability (decided 2026-07-09). Slabs stay 3-D periodic (PW
+# mode requires it); the dipole layer handles the artificial field instead.
 GPAW_CONFIG = {
     'mode': 'pw',            # Plane waves (like VASP); replaces LCAO/DZP
     'ecut': 350,             # eV, OC20 ENCUT=350
@@ -68,6 +79,7 @@ GPAW_CONFIG = {
     'spinpol': False,        # OC20 is NOT spin-polarized (VASP ISPIN default 1)
     # OC20 leaves ISMEAR/SIGMA at VASP defaults: Methfessel-Paxton order 1, 0.2 eV.
     'smearing': {'name': 'methfessel-paxton', 'width': 0.2, 'order': 1},
+    'poissonsolver': {'dipolelayer': 'xy'},  # dipole correction; NOT OC20-matched, see above
     'txt': 'gpaw.txt',       # Output log file
     'convergence': {
         'energy': 1e-5,      # Energy convergence (eV) — tighter than OC20 EDIFF=1e-4
@@ -287,6 +299,7 @@ def setup_gpaw_calculator(label='gpaw', atoms=None):
         kpts=kpts,
         spinpol=GPAW_CONFIG['spinpol'],
         occupations=dict(GPAW_CONFIG['smearing']),
+        poissonsolver=dict(GPAW_CONFIG['poissonsolver']),
         txt=label + '.txt',
         convergence=GPAW_CONFIG['convergence'],
     )
@@ -335,6 +348,13 @@ def _maybe_relax(atoms, label):
 def _slab_energy(atoms, label, relax):
     """Attach a GPAW calculator to a copy of `atoms`, optionally relax, return energy (eV)."""
     atoms = atoms.copy()
+    # VASP's POSCAR format has no non-periodic-direction concept, so every slab
+    # comes back from ase.io.read() as pbc=(True,True,True) regardless of what
+    # generate_structures.py originally set. GPAW's PW-mode dipole-layer poisson
+    # solver requires the perpendicular direction to be non-periodic (it raises
+    # ValueError otherwise) -- restore the intended 2-D-periodic slab geometry
+    # here, the single choke point every slab calculation passes through.
+    atoms.pbc = [True, True, False]
     atoms.calc = setup_gpaw_calculator(label=label, atoms=atoms)
     if relax:
         atoms = _maybe_relax(atoms, label)
@@ -1096,6 +1116,10 @@ def main():
             cached_xc = cached_cfg.get('xc')
             cached_mode = cached_cfg.get('mode')
             cached_ecut = cached_cfg.get('ecut')
+            # H2 itself never gets a dipole layer (see calculate_h2_molecule_energy) so this
+            # key exists only to force a recompute when the slab-side dipole setting changes,
+            # keeping the cache's recorded gpaw_config honest about what produced it.
+            cached_poisson = cached_cfg.get('poissonsolver')
             if cached_steps != RELAXATION_CONFIG['steps']:
                 print(f"⚠️  H2 cache mismatch (steps {cached_steps}→{RELAXATION_CONFIG['steps']}), recomputing")
                 H2_REFERENCE_FILE.unlink()
@@ -1105,6 +1129,10 @@ def main():
             elif (cached_mode, cached_ecut) != (GPAW_CONFIG['mode'], GPAW_CONFIG['ecut']):
                 print(f"⚠️  H2 cache mismatch (mode/ecut {cached_mode}/{cached_ecut}→"
                       f"{GPAW_CONFIG['mode']}/{GPAW_CONFIG['ecut']}), recomputing")
+                H2_REFERENCE_FILE.unlink()
+            elif cached_poisson != GPAW_CONFIG['poissonsolver']:
+                print(f"⚠️  H2 cache mismatch (poissonsolver {cached_poisson}→"
+                      f"{GPAW_CONFIG['poissonsolver']}), recomputing")
                 H2_REFERENCE_FILE.unlink()
         except Exception:
             pass
