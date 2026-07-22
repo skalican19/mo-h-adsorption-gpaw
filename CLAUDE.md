@@ -90,6 +90,23 @@ arrays**:
 - `$ADSORBML_DATA_ROOT` redirects **outputs** to fast scratch (inputs stay in repo);
   steps 1 and 2 must share the same value (manifest stores absolute traj paths).
 
+**AdsorbML on Perun GPU** (aarch64/GH200 nodes; container-based; steps 1 & 2 only —
+rank locally with step 3):
+```
+# once, on a GPU node: build NGC container + fairchem venv, warm the gated uma-m-1p1 cache
+PROJECT_ID=<proj> bash scripts/setup_perun_uma_env.sh --hf-token hf_xxx   # -> /projects/<proj>/hf_cache
+# from the login node: submit each step (step 2 requires step 1's manifest to exist first)
+STEP=1 ACCOUNT=<proj> SIF_PATH=~/containers/pytorch-ngc.sif [INCLUDE="Mo2N_*"] bash scripts/submit_perun_adsorbml.sh
+STEP=2 ACCOUNT=<proj> SIF_PATH=~/containers/pytorch-ngc.sif                      bash scripts/submit_perun_adsorbml.sh
+python scripts/adsorbml/3-extract_rank.py                                        # rank locally (CPU-only)
+```
+- `submit_perun_adsorbml.sh` + `perun_adsorbml_worker.sh`: one GPU job per step
+  (auto-parallel across the node's GPUs; `GRES=gpu:4` for a full node). Outputs go to
+  `$ADSORBML_DATA_ROOT` as usual.
+- `uma-m-1p1` is a **gated** HF model with no repo-side auth handling — `setup_perun_uma_env.sh`
+  warms the cache once (needs `HF_TOKEN` + license accepted) so jobs run `HF_HUB_OFFLINE=1`.
+- Arch/env/partition details + caveats: the `/perun-hpc` skill.
+
 ## Conventions / gotchas
 
 - **Never clobber `data/`.** It holds real, expensive results (hundreds of trajs,

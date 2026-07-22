@@ -42,6 +42,21 @@ This repository contains the scripts, inputs, outputs, and documentation for com
    - Run MACHINE=node3 bash scripts/run_desktop_machine.sh
    - Tune local concurrency with CORES_PER_CALC and optional WORKERS
 
+## AdsorbML ML screening (Perun GPU)
+
+Fast UMA-based H* screening to shortlist candidates before GPAW. On the Perun HPC GPU
+nodes (aarch64/GH200) it runs from an NVIDIA NGC container:
+
+1. Build the env once, on a GPU node (`srun --partition=gpu_short --gres=gpu:1 --pty bash`):
+   - `PROJECT_ID=<proj> bash scripts/setup_perun_uma_env.sh --hf-token hf_xxx`
+   - Builds the container + fairchem venv and caches the gated `uma-m-1p1` weights to `/projects/<proj>/hf_cache`.
+2. Submit the steps from the login node (step 2 needs step 1's manifest first):
+   - `STEP=1 ACCOUNT=<proj> SIF_PATH=~/containers/pytorch-ngc.sif [INCLUDE="Mo2N_*"] bash scripts/submit_perun_adsorbml.sh`
+   - `STEP=2 ACCOUNT=<proj> SIF_PATH=~/containers/pytorch-ngc.sif bash scripts/submit_perun_adsorbml.sh`
+3. Rank locally (CPU-only): `python scripts/adsorbml/3-extract_rank.py`
+
+See the `/perun-hpc` skill (or CLAUDE.md) for arch/env details and caveats.
+
 ## Updated Direction (2026-02-11)
 
 - MoS2/MoSe2 basal planes are inert; next modeling should target edge sites and defects.
