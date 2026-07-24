@@ -28,6 +28,8 @@ set -euo pipefail
 #   SINGULARITY_MODULE  singularity/ce-4.4.1           Lmod module for the container runtime
 #   APPTAINER_MODULE    apptainer                      Lmod module if the site ships apptainer
 #   CONTAINER_BIN       (auto-detected)                full path/name of singularity|apptainer to bypass module logic
+#   SINGULARITY_TMPDIR  /scratch/${PROJECT_ID}/sing_tmp    scratch for the image-pull unpack (default /tmp overflows)
+#   SINGULARITY_CACHEDIR /scratch/${PROJECT_ID}/sing_cache downloaded-layer cache for the pull
 # ----------------------------------------------------------------------------
 
 HF_TOKEN_ARG=""
@@ -59,6 +61,12 @@ if [[ -z "${PROJECT_ID}" ]]; then
   die "PROJECT_ID is required (from \`sprojects\`). Example: PROJECT_ID=myproj bash $0 --hf-token hf_xxx"
 fi
 HF_HOME="${HF_HOME:-/projects/${PROJECT_ID}/hf_cache}"
+# The NGC image is many GB; singularity unpacks it under $SINGULARITY_TMPDIR
+# (default /tmp, RAM-backed on compute nodes → overflows mid-unpack). Redirect
+# temp + layer cache to /scratch (Lustre: big, purged, not backed up — fine for
+# throwaway build data).
+SINGULARITY_TMPDIR="${SINGULARITY_TMPDIR:-/scratch/${PROJECT_ID}/sing_tmp}"
+SINGULARITY_CACHEDIR="${SINGULARITY_CACHEDIR:-/scratch/${PROJECT_ID}/sing_cache}"
 
 # --- 1. Guard: must be on an aarch64 GPU node -------------------------------
 ARCH="$(uname -m)"
@@ -143,7 +151,12 @@ mkdir -p "$(dirname "${SIF_PATH}")"
 if [[ -f "${SIF_PATH}" ]]; then
   log "Image already present: ${SIF_PATH} (skipping pull)"
 else
+  # Give the multi-GB unpack room off /tmp (see config block above).
+  mkdir -p "${SINGULARITY_TMPDIR}" "${SINGULARITY_CACHEDIR}"
+  export SINGULARITY_TMPDIR SINGULARITY_CACHEDIR
+  export APPTAINER_TMPDIR="${SINGULARITY_TMPDIR}" APPTAINER_CACHEDIR="${SINGULARITY_CACHEDIR}"
   log "Pulling nvcr.io/nvidia/pytorch:${NGC_TAG} -> ${SIF_PATH} (needs internet on this node)"
+  log "  tmpdir=${SINGULARITY_TMPDIR}  cachedir=${SINGULARITY_CACHEDIR}"
   "${CONTAINER_BIN}" pull "${SIF_PATH}" "docker://nvcr.io/nvidia/pytorch:${NGC_TAG}"
 fi
 
