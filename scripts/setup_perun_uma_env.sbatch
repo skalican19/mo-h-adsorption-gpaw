@@ -36,9 +36,17 @@
 # ----------------------------------------------------------------------------
 set -euo pipefail
 
-# Run from the repo root (dir the script lives in, one level up from scripts/).
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Run from the repo root. In a SLURM batch job the script runs from a spooled
+# COPY (…/slurm_script), so BASH_SOURCE/$0 do NOT point into the repo —
+# SLURM_SUBMIT_DIR is the dir you ran `sbatch` from (the repo root). The
+# BASH_SOURCE fallback only matters for direct `bash scripts/…sbatch` runs.
+REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)}"
 cd "${REPO_ROOT}"
+if [[ ! -f scripts/setup_perun_uma_env.sh ]]; then
+  echo "[uma-setup] ERROR: not in the repo root (cwd=$(pwd)) — scripts/setup_perun_uma_env.sh missing." >&2
+  echo "            Submit from the repo root: cd <repo> && sbatch --account=<proj> scripts/setup_perun_uma_env.sbatch" >&2
+  exit 1
+fi
 
 # Project id: explicit PROJECT_ID wins, else the SLURM account this job runs under.
 PROJECT_ID="${PROJECT_ID:-${SLURM_JOB_ACCOUNT:-}}"
