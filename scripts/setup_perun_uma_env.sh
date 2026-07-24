@@ -27,6 +27,7 @@ set -euo pipefail
 #   UMA_MODEL    uma-m-1p1                             model checkpoint to warm
 #   SINGULARITY_MODULE  singularity/ce-4.4.1           Lmod module for the container runtime
 #   APPTAINER_MODULE    apptainer                      Lmod module if the site ships apptainer
+#   CONTAINER_BIN       (auto-detected)                full path/name of singularity|apptainer to bypass module logic
 # ----------------------------------------------------------------------------
 
 HF_TOKEN_ARG=""
@@ -67,20 +68,72 @@ if [[ "${ARCH}" != "aarch64" ]]; then
 fi
 
 # --- 2. Locate the container runtime ----------------------------------------
+# `module` is an Lmod shell function. In a non-login `bash <script>` subshell it
+# may be MISSING, or present-but-broken: on Perun's aarch64 GPU nodes an inherited
+# `module` can point at the wrong-arch Lmod tree (/apps/lmod [x86] vs
+# /apps/lmod_gpu [aarch64]) and fail. So we NEVER trust the inherited function —
+# we re-source the init that matches the LIVE launcher ($LMOD_CMD) to install a
+# known-good one. Lmod's init + generated eval trip `set -u`, so we relax
+# nounset/errexit while sourcing and loading.
+KNOWN_CONTAINER_BINS=(
+  /apps/singularity_gpu/bin/singularity
+  /apps/singularity/bin/singularity
+  /apps/apptainer_gpu/bin/apptainer
+  /apps/apptainer/bin/apptainer
+)
+module_available() { command -v module >/dev/null 2>&1 || type module >/dev/null 2>&1; }
+ensure_module_fn() {
+  # Derive the init tree from the live launcher first; it's the authoritative,
+  # arch-correct match. $LMOD_PKG/$MODULESHOME can be stale (wrong-arch) here.
+  local pkg="" init
+  [[ -n "${LMOD_CMD:-}" ]] && pkg="$(dirname "$(dirname "${LMOD_CMD}")")"
+  for init in \
+      "${pkg:+${pkg}/init/bash}" \
+      /apps/lmod_gpu/install/lmod/lmod/init/bash \
+      "${LMOD_PKG:+${LMOD_PKG}/init/bash}" \
+      "${MODULESHOME:+${MODULESHOME}/init/bash}" \
+      /etc/profile.d/z00_lmod.sh \
+      /etc/profile.d/lmod.sh \
+      /etc/profile.d/modules.sh \
+      /usr/share/lmod/lmod/init/bash; do
+    [[ -n "${init}" && -r "${init}" ]] || continue
+    set +u +e
+    # shellcheck disable=SC1090
+    source "${init}" >/dev/null 2>&1 || true
+    set -u -e
+    module_available && return 0
+  done
+  # Nothing sourced cleanly — fall back to whatever was inherited.
+  module_available
+}
+
 load_container_runtime() {
+  # 1. explicit override (full path, or a name already on PATH)
+  if [[ -n "${CONTAINER_BIN:-}" ]] && command -v "${CONTAINER_BIN}" >/dev/null 2>&1; then
+    return
+  fi
+  # 2. already on PATH (e.g. a module the caller pre-loaded)
   if command -v singularity >/dev/null 2>&1; then CONTAINER_BIN=singularity; return; fi
   if command -v apptainer   >/dev/null 2>&1; then CONTAINER_BIN=apptainer;   return; fi
-  if command -v module >/dev/null 2>&1 || type module >/dev/null 2>&1; then
-    module load "${SINGULARITY_MODULE}" 2>/dev/null \
-      || module load singularity          2>/dev/null \
-      || module load "${APPTAINER_MODULE}" 2>/dev/null \
-      || module load apptainer            2>/dev/null || true
+  # 3. Lmod (preferred over a raw binary: the module also sets up cache/bind env)
+  if ensure_module_fn; then
+    set +u +e
+    module load "${SINGULARITY_MODULE}" >/dev/null 2>&1 \
+      || module load singularity          >/dev/null 2>&1 \
+      || module load "${APPTAINER_MODULE}" >/dev/null 2>&1 \
+      || module load apptainer            >/dev/null 2>&1 || true
+    set -u -e
   fi
-  if   command -v singularity >/dev/null 2>&1; then CONTAINER_BIN=singularity
-  elif command -v apptainer   >/dev/null 2>&1; then CONTAINER_BIN=apptainer
-  else die "No singularity/apptainer found (tried modules: ${SINGULARITY_MODULE}, singularity, ${APPTAINER_MODULE}, apptainer).
-       If your site names it differently, set SINGULARITY_MODULE=<name> and re-run."
-  fi
+  if command -v singularity >/dev/null 2>&1; then CONTAINER_BIN=singularity; return; fi
+  if command -v apptainer   >/dev/null 2>&1; then CONTAINER_BIN=apptainer;   return; fi
+  # 4. fallback: known Perun install locations (no Lmod needed; arch-agnostic)
+  local b
+  for b in "${KNOWN_CONTAINER_BINS[@]}"; do
+    if [[ -x "${b}" ]]; then CONTAINER_BIN="${b}"; return; fi
+  done
+  die "No singularity/apptainer found.
+       Tried: CONTAINER_BIN override, PATH, modules (${SINGULARITY_MODULE}, singularity, ${APPTAINER_MODULE}, apptainer), and ${KNOWN_CONTAINER_BINS[*]}.
+       Set CONTAINER_BIN=/full/path/to/singularity to bypass, or SINGULARITY_MODULE=<name>."
 }
 load_container_runtime
 log "Container runtime: ${CONTAINER_BIN}"
