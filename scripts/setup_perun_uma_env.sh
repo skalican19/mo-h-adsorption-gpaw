@@ -25,6 +25,8 @@ set -euo pipefail
 #   UMA_ENV      ${HOME}/envs/uma                      venv (reuses container torch)
 #   HF_HOME      /projects/${PROJECT_ID}/hf_cache      where weights are stored (NOT /home)
 #   UMA_MODEL    uma-m-1p1                             model checkpoint to warm
+#   SINGULARITY_MODULE  singularity/ce-4.4.1           Lmod module for the container runtime
+#   APPTAINER_MODULE    apptainer                      Lmod module if the site ships apptainer
 # ----------------------------------------------------------------------------
 
 HF_TOKEN_ARG=""
@@ -43,6 +45,9 @@ SIF_PATH="${SIF_PATH:-${HOME}/containers/pytorch-ngc.sif}"
 NGC_TAG="${NGC_TAG:-25.01-py3}"
 UMA_ENV="${UMA_ENV:-${HOME}/envs/uma}"
 UMA_MODEL="${UMA_MODEL:-uma-m-1p1}"
+# Lmod won't resolve a bare `singularity` on Perun — it needs the versioned name.
+SINGULARITY_MODULE="${SINGULARITY_MODULE:-singularity/ce-4.4.1}"
+APPTAINER_MODULE="${APPTAINER_MODULE:-apptainer}"
 # HF token: CLI arg wins, else fall back to the environment.
 HF_TOKEN="${HF_TOKEN_ARG:-${HF_TOKEN:-}}"
 
@@ -66,11 +71,15 @@ load_container_runtime() {
   if command -v singularity >/dev/null 2>&1; then CONTAINER_BIN=singularity; return; fi
   if command -v apptainer   >/dev/null 2>&1; then CONTAINER_BIN=apptainer;   return; fi
   if command -v module >/dev/null 2>&1 || type module >/dev/null 2>&1; then
-    module load singularity 2>/dev/null || module load apptainer 2>/dev/null || true
+    module load "${SINGULARITY_MODULE}" 2>/dev/null \
+      || module load singularity          2>/dev/null \
+      || module load "${APPTAINER_MODULE}" 2>/dev/null \
+      || module load apptainer            2>/dev/null || true
   fi
   if   command -v singularity >/dev/null 2>&1; then CONTAINER_BIN=singularity
   elif command -v apptainer   >/dev/null 2>&1; then CONTAINER_BIN=apptainer
-  else die "No singularity/apptainer found (tried \`module load singularity\`)."
+  else die "No singularity/apptainer found (tried modules: ${SINGULARITY_MODULE}, singularity, ${APPTAINER_MODULE}, apptainer).
+       If your site names it differently, set SINGULARITY_MODULE=<name> and re-run."
   fi
 }
 load_container_runtime

@@ -30,14 +30,21 @@ esac
 [[ -n "${SIF_PATH}" && -f "${SIF_PATH}" ]] || die "SIF_PATH not found: ${SIF_PATH}"
 
 # --- Container runtime ------------------------------------------------------
+# Perun's Lmod won't resolve a bare `singularity`; load the versioned module.
+# Override SINGULARITY_MODULE / APPTAINER_MODULE if the site renames it.
+SINGULARITY_MODULE="${SINGULARITY_MODULE:-singularity/ce-4.4.1}"
+APPTAINER_MODULE="${APPTAINER_MODULE:-apptainer}"
 if ! command -v singularity >/dev/null 2>&1 && ! command -v apptainer >/dev/null 2>&1; then
   if command -v module >/dev/null 2>&1 || type module >/dev/null 2>&1; then
-    module load singularity 2>/dev/null || module load apptainer 2>/dev/null || true
+    module load "${SINGULARITY_MODULE}" 2>/dev/null \
+      || module load singularity          2>/dev/null \
+      || module load "${APPTAINER_MODULE}" 2>/dev/null \
+      || module load apptainer            2>/dev/null || true
   fi
 fi
 if   command -v singularity >/dev/null 2>&1; then CONTAINER_BIN=singularity
 elif command -v apptainer   >/dev/null 2>&1; then CONTAINER_BIN=apptainer
-else die "No singularity/apptainer found on the compute node."
+else die "No singularity/apptainer found on the compute node (tried modules: ${SINGULARITY_MODULE}, singularity, ${APPTAINER_MODULE}, apptainer)."
 fi
 
 # --- Python args (step 2 has no --include; scope inherited via the manifest) -
