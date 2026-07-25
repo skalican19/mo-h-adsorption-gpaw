@@ -8,10 +8,10 @@ set -euo pipefail
 # scripts/setup_perun_uma_env.sh. Submit step 1 first (it writes the manifest),
 # then step 2. Step 3 (ranking) is CPU-only bookkeeping — run it locally, not here.
 #
-#   STEP=1 ACCOUNT=<proj> SIF_PATH=~/containers/pytorch-ngc.sif INCLUDE="Mo2N_*" \
+#   STEP=1 ACCOUNT=<proj> SIF_PATH=/project/<proj>/containers/pytorch-ngc.dir INCLUDE="Mo2N_*" \
 #     bash scripts/submit_perun_adsorbml.sh
 #   # ...wait for step 1 to finish, then:
-#   STEP=2 ACCOUNT=<proj> SIF_PATH=~/containers/pytorch-ngc.sif \
+#   STEP=2 ACCOUNT=<proj> SIF_PATH=/project/<proj>/containers/pytorch-ngc.dir \
 #     bash scripts/submit_perun_adsorbml.sh
 #   # ...then locally:
 #   python scripts/adsorbml/3-extract_rank.py
@@ -21,7 +21,7 @@ set -euo pipefail
 #   ACCOUNT             (required) Perun project id (from `sprojects`)
 #   SIF_PATH            (required) container image built by setup_perun_uma_env.sh
 #   UMA_PYTHON          ${HOME}/envs/uma/bin/python    venv python inside the container
-#   HF_HOME             /projects/${ACCOUNT}/hf_cache  warmed weight cache
+#   HF_HOME             /project/${ACCOUNT}/hf_cache   warmed weight cache
 #   PARTITION           gpu_short                      gpu_short|gpu_medium|gpu_long
 #   TIME_LIMIT          12:00:00
 #   GRES                gpu:1                          gpu:4 = a full node (auto-parallel)
@@ -50,7 +50,7 @@ INCLUDE="${INCLUDE:-}"
 WORKERS="${WORKERS:-}"
 LOG_DIR="${LOG_DIR:-${WORKFLOW_ROOT}/data/outputs/perun_logs}"
 JOB_NAME="${JOB_NAME:-adsorbml-s${STEP}-perun}"
-HF_HOME="${HF_HOME:-/projects/${ACCOUNT}/hf_cache}"
+HF_HOME="${HF_HOME:-/project/${ACCOUNT}/hf_cache}"
 HF_OFFLINE="${HF_OFFLINE:-1}"
 
 die() { echo "[submit-perun] ERROR: $*" >&2; exit 1; }
@@ -61,7 +61,7 @@ if [[ "${STEP}" != "1" && "${STEP}" != "2" ]]; then
 fi
 [[ -n "${ACCOUNT}" ]]  || die "ACCOUNT is required (from \`sprojects\`)."
 [[ -n "${SIF_PATH}" ]] || die "SIF_PATH is required (build it with scripts/setup_perun_uma_env.sh)."
-[[ -f "${SIF_PATH}" ]] || die "SIF_PATH not found: ${SIF_PATH}"
+[[ -e "${SIF_PATH}" ]] || die "SIF_PATH not found: ${SIF_PATH}"   # -e: a sandbox is a dir
 
 # Partition sanity check (only if sinfo is available on the login node).
 if command -v sinfo >/dev/null 2>&1; then

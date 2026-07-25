@@ -20,10 +20,10 @@ set -euo pipefail
 #
 # Env-var knobs (defaults):
 #   PROJECT_ID   (required) Perun project id (from `sprojects`); used for HF_HOME
-#   SIF_PATH     ${HOME}/containers/pytorch-ngc.sif   container image path
+#   SIF_PATH     /project/${PROJECT_ID}/containers/pytorch-ngc.dir  SANDBOX image DIR (not a .sif)
 #   NGC_TAG      25.01-py3                             nvcr.io/nvidia/pytorch tag (VERIFY a real one)
 #   UMA_ENV      ${HOME}/envs/uma                      venv (reuses container torch)
-#   HF_HOME      /projects/${PROJECT_ID}/hf_cache      where weights are stored (NOT /home)
+#   HF_HOME      /project/${PROJECT_ID}/hf_cache       where weights are stored (NOT /home)
 #   UMA_MODEL    uma-m-1p1                             model checkpoint to warm
 #   SINGULARITY_MODULE  singularity/ce-4.4.1           Lmod module for the container runtime
 #   APPTAINER_MODULE    apptainer                      Lmod module if the site ships apptainer
@@ -44,7 +44,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 PROJECT_ID="${PROJECT_ID:-}"
-SIF_PATH="${SIF_PATH:-${HOME}/containers/pytorch-ngc.sif}"
+SIF_PATH="${SIF_PATH:-}"   # default set after PROJECT_ID is known (see below)
 NGC_TAG="${NGC_TAG:-25.01-py3}"
 UMA_ENV="${UMA_ENV:-${HOME}/envs/uma}"
 UMA_MODEL="${UMA_MODEL:-uma-m-1p1}"
@@ -60,7 +60,11 @@ die() { echo "[setup-perun] ERROR: $*" >&2; exit 1; }
 if [[ -z "${PROJECT_ID}" ]]; then
   die "PROJECT_ID is required (from \`sprojects\`). Example: PROJECT_ID=myproj bash $0 --hf-token hf_xxx"
 fi
-HF_HOME="${HF_HOME:-/projects/${PROJECT_ID}/hf_cache}"
+HF_HOME="${HF_HOME:-/project/${PROJECT_ID}/hf_cache}"
+# Container image lives on /project (big, persistent), NOT /home (small NFS quota).
+# It's a SANDBOX directory, not a .sif: Perun GPU-node kernels can't mount the
+# .sif squashfs ("bad superblock … compression"); a plain dir needs no mount.
+SIF_PATH="${SIF_PATH:-/project/${PROJECT_ID}/containers/pytorch-ngc.dir}"
 # The NGC image is many GB; singularity unpacks it under $SINGULARITY_TMPDIR
 # (default /tmp, RAM-backed on compute nodes → overflows mid-unpack). Redirect
 # temp + layer cache to /scratch (Lustre: big, purged, not backed up — fine for
@@ -146,18 +150,21 @@ load_container_runtime() {
 load_container_runtime
 log "Container runtime: ${CONTAINER_BIN}"
 
-# --- 3. Pull the NGC PyTorch image (aarch64) if missing ---------------------
+# --- 3. Build the NGC PyTorch image as a SANDBOX (dir) if missing -----------
+# A --sandbox directory, NOT a .sif: Perun GPU-node kernels can't mount the .sif
+# squashfs ("bad superblock … compression"), whereas a plain directory rootfs
+# needs no mount. `singularity exec` treats a dir exactly like a .sif.
 mkdir -p "$(dirname "${SIF_PATH}")"
-if [[ -f "${SIF_PATH}" ]]; then
-  log "Image already present: ${SIF_PATH} (skipping pull)"
+if [[ -e "${SIF_PATH}" ]]; then
+  log "Image already present: ${SIF_PATH} (skipping build)"
 else
   # Give the multi-GB unpack room off /tmp (see config block above).
   mkdir -p "${SINGULARITY_TMPDIR}" "${SINGULARITY_CACHEDIR}"
   export SINGULARITY_TMPDIR SINGULARITY_CACHEDIR
   export APPTAINER_TMPDIR="${SINGULARITY_TMPDIR}" APPTAINER_CACHEDIR="${SINGULARITY_CACHEDIR}"
-  log "Pulling nvcr.io/nvidia/pytorch:${NGC_TAG} -> ${SIF_PATH} (needs internet on this node)"
+  log "Building nvcr.io/nvidia/pytorch:${NGC_TAG} -> ${SIF_PATH} (sandbox; needs internet on this node)"
   log "  tmpdir=${SINGULARITY_TMPDIR}  cachedir=${SINGULARITY_CACHEDIR}"
-  "${CONTAINER_BIN}" pull "${SIF_PATH}" "docker://nvcr.io/nvidia/pytorch:${NGC_TAG}"
+  "${CONTAINER_BIN}" build --sandbox "${SIF_PATH}" "docker://nvcr.io/nvidia/pytorch:${NGC_TAG}"
 fi
 
 # --- 4. Create a venv that reuses the container's CUDA torch ----------------
