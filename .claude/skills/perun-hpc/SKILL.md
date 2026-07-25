@@ -1,6 +1,6 @@
 ---
 name: perun-hpc
-description: How to write and submit SLURM batch scripts to run computations on the Perun HPC cluster (NSCC / HPC SAV). Covers access (ssh, keys), storage layout (/home /projects /scratch /work), the environment (no GPAW/VASP/conda modules — bring your own; x86_64 CPU vs aarch64 GPU split), partitions & limits, accounting (--account, sprojects), copy-paste sbatch templates (single CPU, CPU array for GPAW, GPU for fairchem/UMA), and monitoring. Use whenever writing an sbatch script for Perun, choosing a partition, setting up a cluster Python env, transferring data to/from Perun, or porting this repo's DEVANA launchers to Perun.
+description: How to write and submit SLURM batch scripts to run computations on the Perun HPC cluster (NSCC / HPC SAV). Covers access (ssh, keys), storage layout (/home /project /scratch /work), the environment (no GPAW/VASP/conda modules — bring your own; x86_64 CPU vs aarch64 GPU split), partitions & limits, accounting (--account, sprojects), copy-paste sbatch templates (single CPU, CPU array for GPAW, GPU for fairchem/UMA), and monitoring. Use whenever writing an sbatch script for Perun, choosing a partition, setting up a cluster Python env, transferring data to/from Perun, or porting this repo's DEVANA launchers to Perun.
 ---
 
 # Running computations on Perun (NSCC / HPC SAV)
@@ -11,7 +11,7 @@ existing DEVANA launchers (`scripts/submit_devana_gpaw_array.sh`,
 newer cluster and needs different partitions and an architecture-aware environment.
 
 **Source:** `https://userdocs.hpc.sav.sk/` (was `userdocs.nscc.sk` — 301-redirects to the new host).
-**Verified 2026-07-21.** Docs are a recently-migrated live site; re-check specifics on-cluster
+**Verified 2026-07-21; UMA/GPU container path confirmed on-cluster 2026-07-25.** Docs are a recently-migrated live site; re-check specifics on-cluster
 (`sinfo`, `sprojects`, `quota -s`, `module avail`) before trusting a number here.
 
 > **⚠️ Read the "Verify on-cluster" box at the bottom first.** Several quota numbers are
@@ -25,13 +25,15 @@ newer cluster and needs different partitions and an architecture-aware environme
 - **GPAW** (CPU-only) → `cpu_short` (≤1 day) or `cpu_long` (long jobs). One SLURM **array task
   per structure**, exactly like the DEVANA workflow. See the CPU-array template below.
 - **fairchem / UMA** (Torch, GPU) → `gpu_short|gpu_medium|gpu_long`. **GPU nodes are ARM/aarch64 (GH200)**
-  and need a **CUDA-enabled aarch64 PyTorch** — plain `pip install torch` is CPU-only and silently
-  won't use the GPU. Build the env *on a GPU node* (NGC container or aarch64 CUDA wheels); see §3.
-  It is a *separate* env from GPAW's (different arch).
+  and need a **CUDA-enabled aarch64 PyTorch** — plain `pip install torch` is CPU-only. Use the repo's
+  `scripts/setup_perun_uma_env.sh` (builds an NGC **sandbox** container + fairchem venv on a GPU node;
+  or fire-and-forget via `scripts/setup_perun_uma_env.sbatch`), then `scripts/submit_perun_adsorbml.sh`.
+  **A `.sif` won't mount on GPU nodes — it must be a `--sandbox` directory** (see §3). Separate env
+  from GPAW's (different arch).
 - **No GPAW / VASP / Anaconda module exists on Perun** → bring your own env (reuse
   `scripts/setup_pyenv_env.sh`, which already builds libffi/sqlite rootless).
-- Inputs stay in the repo (`/home` or `/projects`); point big outputs / `$ADSORBML_DATA_ROOT` at
-  `/scratch/<project_id>` or `/projects/<project_id>`; use `/work/$SLURM_JOB_ID` for hot per-job I/O.
+- Inputs stay in the repo (`/home` or `/project`); point big outputs / `$ADSORBML_DATA_ROOT` at
+  `/scratch/<project_id>` or `/project/<project_id>`; use `/work/$SLURM_JOB_ID` for hot per-job I/O.
 - **`--account=<project_id>` on every job.** Get the id from `sprojects -f`.
 
 ---
@@ -53,13 +55,13 @@ ssh -p 5522 <user>@login.perun.sav.sk         # NOTE: port 5522, not 22
 | Mount | Path | Use for | Backup | Persistence |
 |-------|------|---------|--------|-------------|
 | home    | `/home/<user>` (`$HOME`)      | code, scripts, configs, small data | daily | persistent |
-| projects| `/projects/<project_id>`      | **results/outputs**, shared project data | monthly (active only) | 6 mo after project end |
+| projects| `/project/<project_id>`      | **results/outputs**, shared project data | monthly (active only) | 6 mo after project end |
 | scratch | `/scratch/<project_id>`       | temp job I/O, staging | **none** | **auto-purged** |
 | work    | `/work/$SLURM_JOB_ID`         | node-local NVMe, hottest I/O | none | **deleted at job end** |
 
-- Filesystems: Lustre for `/scratch` + `/projects` (best at large sequential I/O), NFS for `/home`.
-- **`/scratch` is not backed up and is purged** — copy results to `/projects` before the job ends.
-- No `$SCRATCH`/`$PROJECT` env var is documented — address scratch/projects by `<project_id>` path.
+- Filesystems: Lustre for `/scratch` + `/project` (best at large sequential I/O), NFS for `/home`.
+- **`/scratch` is not backed up and is purged** — copy results to `/project` before the job ends.
+- No `$SCRATCH`/`$PROJECT` env var is documented — address scratch/project by `<project_id>` path.
 - **Many small files hurt** the metadata servers → aggregate: `tar czf out.tar.gz outdir/`.
 
 **Transfer (all via port 5522):**
@@ -67,7 +69,7 @@ ssh -p 5522 <user>@login.perun.sav.sk         # NOTE: port 5522, not 22
 scp -P 5522 -r <local> <user>@login.perun.sav.sk:<remote>
 rsync -avhP -e "ssh -p 5522" <local>/ <user>@login.perun.sav.sk:<remote>/   # preferred for big trees
 ```
-Check usage: `quota -s`, `du -sh /projects/<id>/`, `sprojects -f`.
+Check usage: `quota -s`, `du -sh /project/<id>/`, `sprojects -f`.
 
 ---
 
@@ -117,18 +119,28 @@ Land on a GPU node first (interactive):
 srun --partition=gpu_short --gres=gpu:1 --time=02:00:00 --pty bash    # aarch64 shell with a GPU
 ```
 
-**Option A — NVIDIA NGC PyTorch container (recommended, most robust on GH200):**
+**Option A — NVIDIA NGC PyTorch container as a `--sandbox` (recommended; what this repo uses):**
 ```bash
-module load singularity
-# Pull an aarch64 image (needs an aarch64 host WITH internet — see the caveat below). Pick a recent tag.
-singularity pull docker://nvcr.io/nvidia/pytorch:25.xx-py3
-# Put fairchem in a venv that reuses the container's CUDA Torch (do not reinstall torch):
-singularity exec --nv pytorch_25.xx-py3.sif python -m venv --system-site-packages ~/envs/uma
-singularity exec --nv pytorch_25.xx-py3.sif ~/envs/uma/bin/pip install fairchem-core fairchem-data-oc
+module load singularity/ce-4.4.1     # bare `singularity` does NOT resolve. Binary: /apps/singularity_gpu/bin/singularity
+# Multi-GB unpack: keep temp+cache OFF /tmp (RAM-backed → overflows). Point them at scratch:
+export SINGULARITY_TMPDIR=/scratch/<id>/sing_tmp SINGULARITY_CACHEDIR=/scratch/<id>/sing_cache
+mkdir -p "$SINGULARITY_TMPDIR" "$SINGULARITY_CACHEDIR" /project/<id>/containers
+# Build a SANDBOX DIRECTORY, not a .sif: the GH200 kernel can't mount the .sif squashfs
+# ("bad superblock … compression"); a plain dir rootfs needs no mount and execs identically.
+# Put it on /project (persistent, big) — NOT /home (small NFS quota; an ~11 GB image won't fit).
+singularity build --sandbox /project/<id>/containers/pytorch-ngc.dir docker://nvcr.io/nvidia/pytorch:25.01-py3
+# fairchem in a venv that reuses the container's CUDA Torch (do NOT reinstall torch):
+singularity exec --nv /project/<id>/containers/pytorch-ngc.dir python -m venv --system-site-packages ~/envs/uma
+singularity exec --nv /project/<id>/containers/pytorch-ngc.dir ~/envs/uma/bin/pip install fairchem-core fairchem-data-oc
 # Verify the GPU is visible from inside the container:
-singularity exec --nv pytorch_25.xx-py3.sif ~/envs/uma/bin/python \
+singularity exec --nv /project/<id>/containers/pytorch-ngc.dir ~/envs/uma/bin/python \
   -c "import torch; print(torch.__version__, torch.cuda.is_available())"   # expect True
 ```
+**This repo automates all of the above** — `scripts/setup_perun_uma_env.sh` (once, on a GPU node, or
+`scripts/setup_perun_uma_env.sbatch` to fire-and-forget). Defaults: sandbox at
+`/project/${PROJECT_ID}/containers/pytorch-ngc.dir`, weights at `/project/${PROJECT_ID}/hf_cache`,
+build temp/cache on `/scratch/${PROJECT_ID}/`. It also handles the broken-`module`-in-subshell issue
+(see the caveat box).
 
 **Option B — native aarch64 pip env (no container):**
 ```bash
@@ -145,10 +157,9 @@ python -c "import torch; print(torch.__version__, torch.cuda.is_available())"   
   they compile from source: keep the `CUDA/` module loaded and set `export TORCH_CUDA_ARCH_LIST=9.0`
   (Hopper) before installing.
 
-**⚠️ Operational unknown — verify on-cluster:** both options need outbound internet *on an aarch64
-host* to fetch wheels/images. Login nodes have internet but are **x86_64** (wrong arch); GPU nodes are
-aarch64 but may lack outbound access. If GPU nodes have no internet, ask HPC support about a proxy or a
-pre-staged image/wheel cache. Build the `.sif`/venv **once**, then just reuse it in batch jobs.
+**Outbound internet:** GPU (aarch64) nodes **DO have outbound internet** (confirmed 2026-07-25 — NGC
+image build + `pip install` + gated HF weight download all ran on `gn*`). Build the sandbox + venv
+**once**, then batch jobs reuse it fully offline (`HF_HUB_OFFLINE=1`).
 
 ---
 
@@ -297,9 +308,9 @@ also uses the GPU via `--nv`; GPAW re-checks the ranked candidates afterward on 
 
 set -euo pipefail
 
-# --- Option A: NGC container (recommended) ---
-module load singularity
-singularity exec --nv -B /scratch,/projects "$HOME/pytorch_25.xx-py3.sif" \
+# --- Option A: NGC sandbox container (recommended) ---
+module load singularity/ce-4.4.1
+singularity exec --nv -B /scratch,/project "/project/<id>/containers/pytorch-ngc.dir" \
     "$HOME/envs/uma/bin/python" -u scripts/adsorbml/1-relax_uma_omat.py --include "Mo2N_*" --workers 1
 
 # --- Option B: native venv (use EITHER A or B, not both) ---
@@ -337,19 +348,20 @@ To target Perun, the deltas are:
 - **Env:** run `scripts/setup_pyenv_env.sh` once on the **login node** (x86_64) for the GPAW/CPU env;
   build any fairchem/UMA env **on a GPU node** (aarch64). Keep the `LD_LIBRARY_PATH` bootstrap export.
 - **Walltime:** cap per partition (`cpu_short` ≤ 1 day; use `cpu_long` beyond that — verify the max).
-- **Storage:** set `$ADSORBML_DATA_ROOT` to `/scratch/<id>` (staging) or `/projects/<id>` (keep),
+- **Storage:** set `$ADSORBML_DATA_ROOT` to `/scratch/<id>` (staging) or `/project/<id>` (keep),
   and copy finals off `/scratch` before job end. Inputs stay in the repo.
 - Everything else (`--account`, `--array=1-N`, `SLURM_ARRAY_TASK_ID`→structure, `--export=ALL,...`)
   carries over unchanged.
 
-*(No Perun launcher scripts exist yet — writing `submit_perun_gpaw_array.sh` + worker is a separate
-task. Use the templates in §7 until then.)*
+*(Perun launchers now exist for the UMA/fairchem GPU path: `setup_perun_uma_env.sh`,
+`setup_perun_uma_env.sbatch`, `submit_perun_adsorbml.sh`, `perun_adsorbml_worker.sh`. A GPAW
+`submit_perun_gpaw_array.sh` + worker is still TODO — use the §7b template until then.)*
 
 ---
 
 ## ⚠️ Verify on-cluster (docs gaps & inconsistencies)
 
-- **Quotas for Perun `/home`, `/projects`, `/scratch` are unpublished** ("content will be added").
+- **Quotas for Perun `/home`, `/project`, `/scratch` are unpublished** ("content will be added").
   Get real numbers with `quota -s` and `sprojects -f`; don't assume the Devana values.
 - **BU/billing formula appears inherited from Devana** (its doc example is headed "Devana nodes, 64
   cores"). Confirm Perun charging before estimating core-hour cost.
@@ -359,8 +371,21 @@ task. Use the templates in §7 until then.)*
 - **`--account` may or may not be strictly mandatory** (job-builder marks Project "optional", but
   examples and the repo's DEVANA submitter require it). Always set it; confirm with `sprojects`.
 - **`sreport` is not documented**; use `sacct` / `seff` / `sstat` for usage & efficiency.
-- **GPU/fairchem env is the fragile part, not SLURM** (§3): needs a CUDA-enabled *aarch64* PyTorch —
-  plain `pip install torch` is CPU-only; use the cu128 aarch64 wheel or an NGC container, and possibly
-  a `torch_scatter` source build (`TORCH_CUDA_ARCH_LIST=9.0`). Also confirm GPU nodes have outbound
-  internet for the install, and check `torch.cuda.is_available()` before launching a real run.
+- **GPU/fairchem env is the fragile part, not SLURM** (§3): needs a CUDA-enabled *aarch64* PyTorch;
+  the robust path is the NGC **sandbox** container (plain `pip install torch` is CPU-only). GPU nodes
+  DO have outbound internet (confirmed). Check `torch.cuda.is_available()` before a real run.
+- **`.sif` images WON'T MOUNT on GPU nodes** (confirmed 2026-07-25): the GH200 kernel rejects the
+  squashfs — `FATAL: … kernel reported a bad superblock … possible causes … compression algorithm …`.
+  Build the container as a `--sandbox` DIRECTORY instead — it execs identically and needs no mount.
+  (§3; `scripts/setup_perun_uma_env.sh` does this.)
+- **Lmod's `module` is broken in non-login subshells on GPU nodes** (confirmed 2026-07-25): a
+  `bash script.sh` / sbatch shell inherits a `module` function that resolves against the wrong-arch
+  Lmod tree — `/apps/lmod` (x86) vs `/apps/lmod_gpu` (aarch64) — and fails, printing Lmod's Lua banner
+  as shell errors (`… lmod: line N: -- : command not found`, `Copyright (C) …`). Fix: re-source the
+  init matching the LIVE launcher, `source "$(dirname "$(dirname "$LMOD_CMD")")/init/bash"`, before
+  `module load` (and wrap it in `set +u`); or skip Lmod and call the binary directly,
+  `/apps/singularity_gpu/bin/singularity`. Both repo Perun scripts already do this.
+- **`/home` is small-quota NFS** — don't stage multi-GB container images there; use `/project` (an
+  ~11 GB image built to `~/containers` truncated silently). The singularity module is
+  `singularity/ce-4.4.1` (bare `singularity` does not resolve).
 - Docs recently moved `nscc.sk` → `hpc.sav.sk`; if a link 404s, swap the host.
