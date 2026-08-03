@@ -26,8 +26,8 @@ newer cluster and needs different partitions and an architecture-aware environme
   per structure**, exactly like the DEVANA workflow. See the CPU-array template below.
 - **fairchem / UMA** (Torch, GPU) → `gpu_short|gpu_medium|gpu_long`. **GPU nodes are ARM/aarch64 (GH200)**
   and need a **CUDA-enabled aarch64 PyTorch** — plain `pip install torch` is CPU-only. Use the repo's
-  `scripts/setup_perun_uma_env.sh` (builds an NGC **sandbox** container + fairchem venv on a GPU node;
-  or fire-and-forget via `scripts/setup_perun_uma_env.sbatch`), then `scripts/submit_perun_adsorbml.sh`.
+  `scripts/hpc_scripts/adsorbml/setup_perun_uma_env.sh` (builds an NGC **sandbox** container + fairchem
+  venv on a GPU node), then `scripts/hpc_scripts/adsorbml/submit_perun_adsorbml.sh`.
   **A `.sif` won't mount on GPU nodes — it must be a `--sandbox` directory** (see §3). Separate env
   from GPAW's (different arch).
 - **No GPAW / VASP / Anaconda module exists on Perun** → bring your own env (reuse
@@ -136,8 +136,8 @@ singularity exec --nv /project/<id>/containers/pytorch-ngc.dir ~/envs/uma/bin/pi
 singularity exec --nv /project/<id>/containers/pytorch-ngc.dir ~/envs/uma/bin/python \
   -c "import torch; print(torch.__version__, torch.cuda.is_available())"   # expect True
 ```
-**This repo automates all of the above** — `scripts/setup_perun_uma_env.sh` (once, on a GPU node, or
-`scripts/setup_perun_uma_env.sbatch` to fire-and-forget). Defaults: sandbox at
+**This repo automates all of the above** — `scripts/hpc_scripts/adsorbml/setup_perun_uma_env.sh`
+(run once, on a GPU node). Defaults: sandbox at
 `/project/${PROJECT_ID}/containers/pytorch-ngc.dir`, weights at `/project/${PROJECT_ID}/hf_cache`,
 build temp/cache on `/scratch/${PROJECT_ID}/`. It also handles the broken-`module`-in-subshell issue
 (see the caveat box).
@@ -291,7 +291,7 @@ sbatch --array=1-"$N"%20 --export=ALL,MANIFEST_PATH="$MANIFEST_PATH" gpaw_array.
 `scancel <jobid>_[1-3]`, `scancel <jobid>`.
 
 ### 7c. GPU job — fairchem / UMA screening (uses the aarch64 env from §3)
-Requires the CUDA-enabled aarch64 env built in §3 (container `.sif` **or** native venv). fairchem
+Requires the CUDA-enabled aarch64 env built in §3 (NGC `--sandbox` dir **or** native venv). fairchem
 also uses the GPU via `--nv`; GPAW re-checks the ranked candidates afterward on the CPU partitions (§7b).
 ```bash
 #!/usr/bin/env bash
@@ -353,8 +353,8 @@ To target Perun, the deltas are:
 - Everything else (`--account`, `--array=1-N`, `SLURM_ARRAY_TASK_ID`→structure, `--export=ALL,...`)
   carries over unchanged.
 
-*(Perun launchers now exist for the UMA/fairchem GPU path: `setup_perun_uma_env.sh`,
-`setup_perun_uma_env.sbatch`, `submit_perun_adsorbml.sh`, `perun_adsorbml_worker.sh`. A GPAW
+*(Perun launchers now exist for the UMA/fairchem GPU path, under `scripts/hpc_scripts/adsorbml/`:
+`setup_perun_uma_env.sh`, `submit_perun_adsorbml.sh`, `perun_adsorbml_worker.sh`. A GPAW
 `submit_perun_gpaw_array.sh` + worker is still TODO — use the §7b template until then.)*
 
 ---
@@ -377,7 +377,7 @@ To target Perun, the deltas are:
 - **`.sif` images WON'T MOUNT on GPU nodes** (confirmed 2026-07-25): the GH200 kernel rejects the
   squashfs — `FATAL: … kernel reported a bad superblock … possible causes … compression algorithm …`.
   Build the container as a `--sandbox` DIRECTORY instead — it execs identically and needs no mount.
-  (§3; `scripts/setup_perun_uma_env.sh` does this.)
+  (§3; `scripts/hpc_scripts/adsorbml/setup_perun_uma_env.sh` does this.)
 - **Lmod's `module` is broken in non-login subshells on GPU nodes** (confirmed 2026-07-25): a
   `bash script.sh` / sbatch shell inherits a `module` function that resolves against the wrong-arch
   Lmod tree — `/apps/lmod` (x86) vs `/apps/lmod_gpu` (aarch64) — and fails, printing Lmod's Lua banner

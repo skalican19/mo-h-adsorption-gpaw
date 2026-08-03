@@ -30,6 +30,8 @@ scripts/
   generate_structures.py     # build all POSCARs under data/inputs/VASP_inputs/<name>/
   gpaw_h_adsorption.py        # PRIMARY calculator; 3 modes (see CLI flags below)
   adsorbml/                   # ML screening pipeline (steps 1-3) + _common.py
+  hpc_scripts/adsorbml/       # Perun GPU launchers for the AdsorbML pipeline
+                              #   (setup_perun_uma_env.sh, submit_perun_adsorbml.sh, perun_adsorbml_worker.sh)
   compute_h_adsorption.py     # LEGACY: Materials Project + VASP input templating
   parse_vasp_results.py       # LEGACY: parse VASP OUTCARs -> ΔG_H
   *.sh                        # HPC (DEVANA/SLURM) + desktop launchers & workers
@@ -94,11 +96,12 @@ arrays**:
 rank locally with step 3):
 ```
 # once, on a GPU node: build NGC container + fairchem venv, warm the gated uma-m-1p1 cache
-PROJECT_ID=<proj> bash scripts/setup_perun_uma_env.sh --hf-token hf_xxx   # -> /projects/<proj>/hf_cache
+PROJECT_ID=<proj> bash scripts/hpc_scripts/adsorbml/setup_perun_uma_env.sh --hf-token hf_xxx   # -> /project/<proj>/hf_cache
 # from the login node: submit each step (step 2 requires step 1's manifest to exist first)
-STEP=1 ACCOUNT=<proj> SIF_PATH=~/containers/pytorch-ngc.sif [INCLUDE="Mo2N_*"] bash scripts/submit_perun_adsorbml.sh
-STEP=2 ACCOUNT=<proj> SIF_PATH=~/containers/pytorch-ngc.sif                      bash scripts/submit_perun_adsorbml.sh
-python scripts/adsorbml/3-extract_rank.py                                        # rank locally (CPU-only)
+# SIF_PATH is a --sandbox DIR on /project (not a .sif; not ~/ — small NFS quota truncates the ~11 GB image)
+STEP=1 ACCOUNT=<proj> SIF_PATH=/project/<proj>/containers/pytorch-ngc.dir [INCLUDE="Mo2N_*"] bash scripts/hpc_scripts/adsorbml/submit_perun_adsorbml.sh
+STEP=2 ACCOUNT=<proj> SIF_PATH=/project/<proj>/containers/pytorch-ngc.dir                     bash scripts/hpc_scripts/adsorbml/submit_perun_adsorbml.sh
+python scripts/adsorbml/3-extract_rank.py                                                     # rank locally (CPU-only)
 ```
 - `submit_perun_adsorbml.sh` + `perun_adsorbml_worker.sh`: one GPU job per step
   (auto-parallel across the node's GPUs; `GRES=gpu:4` for a full node). Outputs go to

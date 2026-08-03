@@ -12,7 +12,7 @@ set -euo pipefail
 #
 # RUN THIS INTERACTIVELY ON A GPU NODE (it needs the aarch64 arch + a GPU + net):
 #   srun --partition=gpu_short --gres=gpu:1 --time=02:00:00 --pty bash
-#   PROJECT_ID=<proj> bash scripts/setup_perun_uma_env.sh --hf-token hf_xxx
+#   PROJECT_ID=<proj> bash scripts/hpc_scripts/adsorbml/setup_perun_uma_env.sh --hf-token hf_xxx
 #
 # The UMA model (uma-m-1p1) is a GATED HuggingFace model. Before running:
 #   1. Accept its license once on the HuggingFace model page.
@@ -209,7 +209,7 @@ fi
 # --- 7. Summary: values to hand to the submitter ----------------------------
 cat <<EOF
 
-[setup-perun] Done. Pass these to scripts/submit_perun_adsorbml.sh:
+[setup-perun] Done. Pass these to scripts/hpc_scripts/adsorbml/submit_perun_adsorbml.sh:
 
     SIF_PATH=${SIF_PATH}
     UMA_PYTHON=${UMA_ENV}/bin/python
@@ -217,5 +217,5 @@ cat <<EOF
 
 Example (from the login node):
     STEP=1 ACCOUNT=${PROJECT_ID} SIF_PATH=${SIF_PATH} \\
-      bash scripts/submit_perun_adsorbml.sh
+      bash scripts/hpc_scripts/adsorbml/submit_perun_adsorbml.sh
 EOF
