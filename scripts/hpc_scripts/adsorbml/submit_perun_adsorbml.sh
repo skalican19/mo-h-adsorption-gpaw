@@ -4,14 +4,15 @@ set -euo pipefail
 # ============================================================================
 # submit_perun_adsorbml.sh — submit ONE AdsorbML GPU step on Perun (login node)
 # ============================================================================
-# Runs a single AdsorbML pipeline step inside the aarch64 NGC container built by
-# scripts/hpc_scripts/adsorbml/setup_perun_uma_env.sh. Submit step 1 first (it writes the manifest),
-# then step 2. Step 3 (ranking) is CPU-only bookkeeping — run it locally, not here.
+# Runs a single AdsorbML pipeline step with the native aarch64 fairchem venv built
+# by scripts/hpc_scripts/adsorbml/setup_perun_uma_env.sh. Submit step 1 first (it
+# writes the manifest), then step 2. Step 3 (ranking) is CPU-only bookkeeping —
+# run it locally, not here.
 #
-#   STEP=1 ACCOUNT=<proj> SIF_PATH=/project/<proj>/containers/pytorch-ngc.dir INCLUDE="Mo2N_*" \
+#   STEP=1 ACCOUNT=<proj> UMA_PYTHON=$HOME/envs/uma/bin/python INCLUDE="Mo2N_*" \
 #     bash scripts/hpc_scripts/adsorbml/submit_perun_adsorbml.sh
 #   # ...wait for step 1 to finish, then:
-#   STEP=2 ACCOUNT=<proj> SIF_PATH=/project/<proj>/containers/pytorch-ngc.dir \
+#   STEP=2 ACCOUNT=<proj> UMA_PYTHON=$HOME/envs/uma/bin/python \
 #     bash scripts/hpc_scripts/adsorbml/submit_perun_adsorbml.sh
 #   # ...then locally:
 #   python scripts/adsorbml/3-extract_rank.py
@@ -19,8 +20,8 @@ set -euo pipefail
 # Env-var knobs (defaults):
 #   STEP                (required) 1 (relax) or 2 (screen H* sites)
 #   ACCOUNT             (required) Perun project id (from `sprojects`)
-#   SIF_PATH            (required) container image built by setup_perun_uma_env.sh
-#   UMA_PYTHON          ${HOME}/envs/uma/bin/python    venv python inside the container
+#   UMA_PYTHON          ${HOME}/envs/uma/bin/python    venv python from setup_perun_uma_env.sh
+#   PYTHON_MODULE       (empty = read from the venv)   site Python module the worker reloads
 #   HF_HOME             /project/${ACCOUNT}/hf_cache   warmed weight cache
 #   PARTITION           gpu_short                      gpu_short|gpu_medium|gpu_long
 #   TIME_LIMIT          12:00:00
@@ -32,17 +33,14 @@ set -euo pipefail
 #   WORKERS             (empty = auto)                 workers; auto = one per visible GPU
 #   LOG_DIR             <repo>/data/outputs/perun_logs
 #   JOB_NAME            adsorbml-s${STEP}-perun
-#   CONTAINER_BIN       (auto-detected)                full path/name of singularity|apptainer
-#                                                      to bypass Lmod entirely on the compute node
-#                                                      (e.g. /apps/singularity_gpu/bin/singularity)
 # ----------------------------------------------------------------------------
 
 WORKFLOW_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"  # scripts/hpc_scripts/adsorbml -> repo root
 
 STEP="${STEP:-}"
 ACCOUNT="${ACCOUNT:-}"
-SIF_PATH="${SIF_PATH:-}"
 UMA_PYTHON="${UMA_PYTHON:-${HOME}/envs/uma/bin/python}"
+PYTHON_MODULE="${PYTHON_MODULE:-}"
 PARTITION="${PARTITION:-gpu_short}"
 TIME_LIMIT="${TIME_LIMIT:-12:00:00}"
 GRES="${GRES:-gpu:1}"
@@ -55,17 +53,16 @@ LOG_DIR="${LOG_DIR:-${WORKFLOW_ROOT}/data/outputs/perun_logs}"
 JOB_NAME="${JOB_NAME:-adsorbml-s${STEP}-perun}"
 HF_HOME="${HF_HOME:-/project/${ACCOUNT}/hf_cache}"
 HF_OFFLINE="${HF_OFFLINE:-1}"
-CONTAINER_BIN="${CONTAINER_BIN:-}"
 
 die() { echo "[submit-perun] ERROR: $*" >&2; exit 1; }
 
 # --- Validation -------------------------------------------------------------
 if [[ "${STEP}" != "1" && "${STEP}" != "2" ]]; then
-  die "STEP must be 1 or 2. Example: STEP=1 ACCOUNT=proj SIF_PATH=... bash $0"
+  die "STEP must be 1 or 2. Example: STEP=1 ACCOUNT=proj bash $0"
 fi
-[[ -n "${ACCOUNT}" ]]  || die "ACCOUNT is required (from \`sprojects\`)."
-[[ -n "${SIF_PATH}" ]] || die "SIF_PATH is required (build it with scripts/hpc_scripts/adsorbml/setup_perun_uma_env.sh)."
-[[ -e "${SIF_PATH}" ]] || die "SIF_PATH not found: ${SIF_PATH}"   # -e: a sandbox is a dir
+[[ -n "${ACCOUNT}" ]]     || die "ACCOUNT is required (from \`sprojects\`)."
+[[ -e "${UMA_PYTHON}" ]]  || die "UMA_PYTHON not found: ${UMA_PYTHON}
+     Build the env first on a GPU node: scripts/hpc_scripts/adsorbml/setup_perun_uma_env.sh"
 
 # Partition sanity check (only if sinfo is available on the login node).
 if command -v sinfo >/dev/null 2>&1; then
@@ -89,7 +86,7 @@ mkdir -p "${LOG_DIR}"
 
 echo "[submit-perun] Submitting AdsorbML step ${STEP}"
 echo "  account=${ACCOUNT}  partition=${PARTITION}  gres=${GRES}  time=${TIME_LIMIT}"
-echo "  sif=${SIF_PATH}"
+echo "  python=${UMA_PYTHON}"
 echo "  data_root=${ADSORBML_DATA_ROOT}  hf_home=${HF_HOME}"
 [[ "${STEP}" == "1" && -n "${INCLUDE}" ]] && echo "  include=${INCLUDE}"
 [[ -n "${WORKERS}" ]] && echo "  workers=${WORKERS}"
@@ -106,5 +103,5 @@ sbatch \
   --time="${TIME_LIMIT}" \
   --output="${LOG_DIR}/%x_%j.out" \
   --error="${LOG_DIR}/%x_%j.err" \
-  --export=ALL,WORKFLOW_ROOT="${WORKFLOW_ROOT}",STEP="${STEP}",SIF_PATH="${SIF_PATH}",UMA_PYTHON="${UMA_PYTHON}",HF_HOME="${HF_HOME}",HF_OFFLINE="${HF_OFFLINE}",ADSORBML_DATA_ROOT="${ADSORBML_DATA_ROOT}",INCLUDE="${INCLUDE}",WORKERS="${WORKERS}",CONTAINER_BIN="${CONTAINER_BIN}" \
+  --export=ALL,WORKFLOW_ROOT="${WORKFLOW_ROOT}",STEP="${STEP}",UMA_PYTHON="${UMA_PYTHON}",PYTHON_MODULE="${PYTHON_MODULE}",HF_HOME="${HF_HOME}",HF_OFFLINE="${HF_OFFLINE}",ADSORBML_DATA_ROOT="${ADSORBML_DATA_ROOT}",INCLUDE="${INCLUDE}",WORKERS="${WORKERS}" \
   "${WORKFLOW_ROOT}/scripts/hpc_scripts/adsorbml/perun_adsorbml_worker.sh"

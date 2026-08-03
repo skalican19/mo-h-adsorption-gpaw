@@ -1,8 +1,9 @@
 # Running AdsorbML on Perun (GPU) — short guide
 
-Runs AdsorbML steps **1 (relax)** and **2 (screen H\* sites)** on Perun's GPU nodes via an
-NVIDIA NGC container. Step **3 (rank)** is CPU-only — run it locally. Three scripts:
-`scripts/hpc_scripts/adsorbml/setup_perun_uma_env.sh`, `scripts/hpc_scripts/adsorbml/submit_perun_adsorbml.sh`, `scripts/hpc_scripts/adsorbml/perun_adsorbml_worker.sh`.
+Runs AdsorbML steps **1 (relax)** and **2 (screen H\* sites)** on Perun's GPU nodes
+(aarch64/GH200) using a native fairchem venv. Step **3 (rank)** is CPU-only — run it
+locally. Three scripts: `scripts/hpc_scripts/adsorbml/setup_perun_uma_env.sh`,
+`scripts/hpc_scripts/adsorbml/submit_perun_adsorbml.sh`, `scripts/hpc_scripts/adsorbml/perun_adsorbml_worker.sh`.
 
 ## 0. Before you start (one-time)
 
@@ -10,7 +11,7 @@ NVIDIA NGC container. Step **3 (rank)** is CPU-only — run it locally. Three sc
 - **Project id:** run `sprojects` — you use it as `PROJECT_ID` / `ACCOUNT` below.
 - **HuggingFace:** the `uma-m-1p1` model is *gated*. On huggingface.co: accept its license,
   then create an access token (Settings → Access Tokens). That token is your `hf_xxx`.
-- **Get the repo onto Perun** (from the **login node** — it has internet; compute nodes may not):
+- **Get the repo onto Perun** (from the **login node** — it has internet):
   ```bash
   git clone <your-repo-url> ~/mo-h-adsorption-gpaw     # or `git pull` later to update
   ```
@@ -27,18 +28,19 @@ cd ~/mo-h-adsorption-gpaw
 PROJECT_ID=<proj> bash scripts/hpc_scripts/adsorbml/setup_perun_uma_env.sh --hf-token hf_xxx
 ```
 
-This pulls the NGC PyTorch container, builds a fairchem venv, and downloads the model weights
-to `/project/<proj>/hf_cache`. It should end by printing `torch.cuda.is_available() ... True`
-and the `SIF_PATH` / `UMA_PYTHON` / `HF_HOME` values. Do this **once**; then `exit` the GPU node.
+This loads a site Python module, builds a venv at `~/envs/uma`, installs the CUDA aarch64
+`torch==2.8.0+cu129` wheel + fairchem, and downloads the model weights to `/project/<proj>/hf_cache`.
+It should end by printing `torch.cuda.is_available() ... True` and the `UMA_PYTHON` / `HF_HOME`
+values. Do this **once**; then `exit` the GPU node.
 
-> If it can't reach the internet from the GPU node (pull or download fails), ask HPC support —
-> you may need a proxy or a pre-staged image. Everything below depends on this step succeeding.
+> If the default Python module name isn't right, pass `PYTHON_MODULE=<name>` (the script prints
+> `module avail Python` on failure so you can pick one; fairchem needs 3.11–3.13).
 
 ## 2. Run step 1 (relax) — from the login node
 
 ```bash
 cd ~/mo-h-adsorption-gpaw
-STEP=1 ACCOUNT=<proj> SIF_PATH=/project/<proj>/containers/pytorch-ngc.dir \
+STEP=1 ACCOUNT=<proj> UMA_PYTHON=$HOME/envs/uma/bin/python \
   INCLUDE="Mo2N_*" \
   bash scripts/hpc_scripts/adsorbml/submit_perun_adsorbml.sh
 ```
@@ -50,7 +52,7 @@ STEP=1 ACCOUNT=<proj> SIF_PATH=/project/<proj>/containers/pytorch-ngc.dir \
 ## 3. Run step 2 (screen H\* sites) — after step 1 finishes
 
 ```bash
-STEP=2 ACCOUNT=<proj> SIF_PATH=/project/<proj>/containers/pytorch-ngc.dir \
+STEP=2 ACCOUNT=<proj> UMA_PYTHON=$HOME/envs/uma/bin/python \
   bash scripts/hpc_scripts/adsorbml/submit_perun_adsorbml.sh
 ```
 
@@ -79,7 +81,8 @@ Outputs: `data/uma_relaxed/`, `data/adsorbml_manifest.csv`, `data/adsorbml_resul
 |-----|---------|-------|
 | `STEP` | — (required) | `1` or `2` |
 | `ACCOUNT` | — (required) | project id from `sprojects` |
-| `SIF_PATH` | — (required) | container from step 1 (`/project/<proj>/containers/pytorch-ngc.dir`; a `--sandbox` dir, not a `.sif`) |
+| `UMA_PYTHON` | `$HOME/envs/uma/bin/python` | venv python from step 1 |
+| `PYTHON_MODULE` | (read from the venv) | site Python module the worker reloads at runtime |
 | `INCLUDE` | all | glob filter, step 1 only (e.g. `"Mo2N_*"`) |
 | `GRES` | `gpu:1` | `gpu:4` = full node, ~4× faster (auto-parallel) |
 | `PARTITION` | `gpu_short` | `gpu_medium` (2d) / `gpu_long` (4d) for longer runs |
@@ -89,9 +92,10 @@ Outputs: `data/uma_relaxed/`, `data/adsorbml_manifest.csv`, `data/adsorbml_resul
 
 ## Gotchas
 
-- **Set the right `NGC_TAG` in step 1.** The default is a guess — pick a real
-  `nvcr.io/nvidia/pytorch` aarch64 tag (`NGC_TAG=<tag> bash scripts/hpc_scripts/adsorbml/setup_perun_uma_env.sh ...`).
 - **Steps 1 and 2 must share `ADSORBML_DATA_ROOT`** (the manifest stores absolute paths).
-- **`/scratch` is purged, not backed up** — if you stage there, copy results to `/projects`
+- **`/scratch` is purged, not backed up** — if you stage there, copy results to `/project`
   before the job's walltime ends.
-- Full arch/partition/accounting detail lives in the `/perun-hpc` skill.
+- The venv is built from a site Python module; the worker reloads that same module at runtime
+  (recorded in `~/envs/uma/.python_module`) so its python finds libpython.
+- Full arch/partition/accounting detail — and why this uses a native venv rather than a
+  container — lives in the `/perun-hpc` skill.

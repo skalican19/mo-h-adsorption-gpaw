@@ -45,14 +45,14 @@ This repository contains the scripts, inputs, outputs, and documentation for com
 ## AdsorbML ML screening (Perun GPU)
 
 Fast UMA-based H* screening to shortlist candidates before GPAW. On the Perun HPC GPU
-nodes (aarch64/GH200) it runs from an NVIDIA NGC container:
+nodes (aarch64/GH200) it runs from a native fairchem venv:
 
 1. Build the env once, on a GPU node (`srun --partition=gpu_short --gres=gpu:1 --pty bash`):
    - `PROJECT_ID=<proj> bash scripts/hpc_scripts/adsorbml/setup_perun_uma_env.sh --hf-token hf_xxx`
-   - Builds the container + fairchem venv and caches the gated `uma-m-1p1` weights to `/project/<proj>/hf_cache`.
+   - Builds the aarch64 CUDA fairchem venv (`~/envs/uma`) and caches the gated `uma-m-1p1` weights to `/project/<proj>/hf_cache`.
 2. Submit the steps from the login node (step 2 needs step 1's manifest first):
-   - `STEP=1 ACCOUNT=<proj> SIF_PATH=/project/<proj>/containers/pytorch-ngc.dir [INCLUDE="Mo2N_*"] bash scripts/hpc_scripts/adsorbml/submit_perun_adsorbml.sh`
-   - `STEP=2 ACCOUNT=<proj> SIF_PATH=/project/<proj>/containers/pytorch-ngc.dir bash scripts/hpc_scripts/adsorbml/submit_perun_adsorbml.sh`
+   - `STEP=1 ACCOUNT=<proj> UMA_PYTHON=$HOME/envs/uma/bin/python [INCLUDE="Mo2N_*"] bash scripts/hpc_scripts/adsorbml/submit_perun_adsorbml.sh`
+   - `STEP=2 ACCOUNT=<proj> UMA_PYTHON=$HOME/envs/uma/bin/python bash scripts/hpc_scripts/adsorbml/submit_perun_adsorbml.sh`
 3. Rank locally (CPU-only): `python scripts/adsorbml/3-extract_rank.py`
 
 See the `/perun-hpc` skill (or CLAUDE.md) for arch/env details and caveats.

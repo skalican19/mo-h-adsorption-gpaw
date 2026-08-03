@@ -11,7 +11,7 @@ existing DEVANA launchers (`scripts/submit_devana_gpaw_array.sh`,
 newer cluster and needs different partitions and an architecture-aware environment.
 
 **Source:** `https://userdocs.hpc.sav.sk/` (was `userdocs.nscc.sk` — 301-redirects to the new host).
-**Verified 2026-07-21; UMA/GPU container path confirmed on-cluster 2026-07-25.** Docs are a recently-migrated live site; re-check specifics on-cluster
+**Verified 2026-07-21; native UMA/GPU env confirmed on-cluster 2026-08-03.** Docs are a recently-migrated live site; re-check specifics on-cluster
 (`sinfo`, `sprojects`, `quota -s`, `module avail`) before trusting a number here.
 
 > **⚠️ Read the "Verify on-cluster" box at the bottom first.** Several quota numbers are
@@ -25,11 +25,10 @@ newer cluster and needs different partitions and an architecture-aware environme
 - **GPAW** (CPU-only) → `cpu_short` (≤1 day) or `cpu_long` (long jobs). One SLURM **array task
   per structure**, exactly like the DEVANA workflow. See the CPU-array template below.
 - **fairchem / UMA** (Torch, GPU) → `gpu_short|gpu_medium|gpu_long`. **GPU nodes are ARM/aarch64 (GH200)**
-  and need a **CUDA-enabled aarch64 PyTorch** — plain `pip install torch` is CPU-only. Use the repo's
-  `scripts/hpc_scripts/adsorbml/setup_perun_uma_env.sh` (builds an NGC **sandbox** container + fairchem
-  venv on a GPU node), then `scripts/hpc_scripts/adsorbml/submit_perun_adsorbml.sh`.
-  **A `.sif` won't mount on GPU nodes — it must be a `--sandbox` directory** (see §3). Separate env
-  from GPAW's (different arch).
+  and need a **CUDA-enabled aarch64 PyTorch** — plain `pip install torch` is CPU-only; the wheel that
+  works is `torch==2.8.0+cu129` (see §3). Use the repo's
+  `scripts/hpc_scripts/adsorbml/setup_perun_uma_env.sh` (builds a native fairchem venv on a GPU node),
+  then `scripts/hpc_scripts/adsorbml/submit_perun_adsorbml.sh`. Separate env from GPAW's (different arch).
 - **No GPAW / VASP / Anaconda module exists on Perun** → bring your own env (reuse
   `scripts/setup_pyenv_env.sh`, which already builds libffi/sqlite rootless).
 - Inputs stay in the repo (`/home` or `/project`); point big outputs / `$ADSORBML_DATA_ROOT` at
@@ -110,56 +109,53 @@ module list ; module purge      # ml = alias for module
 
 GPU screening on Perun means running Torch/fairchem on the **aarch64 (ARM)** Grace-Hopper GH200
 nodes (CUDA compute capability **9.0**). The trap: **a plain `pip install torch` on aarch64 installs
-a CPU-only build that silently ignores the GPU** — you must obtain a CUDA-enabled *aarch64* PyTorch.
-Build the env **on a GPU node** so wheels match the arch; `setup_pyenv_env.sh` is for the CPU/GPAW
-env and will NOT produce a CUDA Torch here.
+a CPU-only build that silently ignores the GPU** — and fairchem-core pins **`torch~=2.8.0`**, whose
+only aarch64 CUDA wheel lives on the **cu129** index (cu128 skips 2.8). Build the env **on a GPU node**
+so wheels match the arch; `setup_pyenv_env.sh` is for the CPU/GPAW env and will NOT produce a CUDA
+Torch here.
 
 Land on a GPU node first (interactive):
 ```bash
 srun --partition=gpu_short --gres=gpu:1 --time=02:00:00 --pty bash    # aarch64 shell with a GPU
 ```
 
-**Option A — NVIDIA NGC PyTorch container as a `--sandbox` (recommended; what this repo uses):**
+**Native aarch64 venv (what this repo uses):**
 ```bash
-module load singularity/ce-4.4.1     # bare `singularity` does NOT resolve. Binary: /apps/singularity_gpu/bin/singularity
-# Multi-GB unpack: keep temp+cache OFF /tmp (RAM-backed → overflows). Point them at scratch:
-export SINGULARITY_TMPDIR=/scratch/<id>/sing_tmp SINGULARITY_CACHEDIR=/scratch/<id>/sing_cache
-mkdir -p "$SINGULARITY_TMPDIR" "$SINGULARITY_CACHEDIR" /project/<id>/containers
-# Build a SANDBOX DIRECTORY, not a .sif: the GH200 kernel can't mount the .sif squashfs
-# ("bad superblock … compression"); a plain dir rootfs needs no mount and execs identically.
-# Put it on /project (persistent, big) — NOT /home (small NFS quota; an ~11 GB image won't fit).
-singularity build --sandbox /project/<id>/containers/pytorch-ngc.dir docker://nvcr.io/nvidia/pytorch:25.01-py3
-# fairchem in a venv that reuses the container's CUDA Torch (do NOT reinstall torch):
-singularity exec --nv /project/<id>/containers/pytorch-ngc.dir python -m venv --system-site-packages ~/envs/uma
-singularity exec --nv /project/<id>/containers/pytorch-ngc.dir ~/envs/uma/bin/pip install fairchem-core fairchem-data-oc
-# Verify the GPU is visible from inside the container:
-singularity exec --nv /project/<id>/containers/pytorch-ngc.dir ~/envs/uma/bin/python \
-  -c "import torch; print(torch.__version__, torch.cuda.is_available())"   # expect True
-```
-**This repo automates all of the above** — `scripts/hpc_scripts/adsorbml/setup_perun_uma_env.sh`
-(run once, on a GPU node). Defaults: sandbox at
-`/project/${PROJECT_ID}/containers/pytorch-ngc.dir`, weights at `/project/${PROJECT_ID}/hf_cache`,
-build temp/cache on `/scratch/${PROJECT_ID}/`. It also handles the broken-`module`-in-subshell issue
-(see the caveat box).
-
-**Option B — native aarch64 pip env (no container):**
-```bash
-module load Python/3.12.3-GCCcore-13.3.0 CUDA/12.8.0
-python -m venv ~/envs/uma-aarch64 && source ~/envs/uma-aarch64/bin/activate
+module load Python/3.12.3-GCCcore-13.3.0             # fairchem needs Python 3.11–3.13
+python -m venv ~/envs/uma && source ~/envs/uma/bin/activate
 pip install --upgrade pip
-pip install torch --index-url https://download.pytorch.org/whl/cu128   # aarch64 CUDA wheel (torch>=2.7)
+# torch FIRST, from cu129 — the only aarch64 CUDA torch-2.8 wheel; installing fairchem
+# first would drag in a CPU-only torch off PyPI:
+pip install --index-url https://download.pytorch.org/whl/cu129 "torch==2.8.0+cu129"
 pip install fairchem-core fairchem-data-oc
-python -c "import torch; print(torch.__version__, torch.cuda.is_available())"   # MUST print True
+python -c "import torch; print(torch.__version__, torch.cuda.is_available())"   # expect: 2.8.0+cu129 True
 ```
-- Match the `cuXXX` wheel index to the loaded `CUDA/` module (cu128 ↔ CUDA 12.8). torch ≥2.11 also
-  ships aarch64 CUDA wheels on plain PyPI (no `--index-url` needed).
+- The cu129 wheel bundles its own CUDA runtime — **no `CUDA/` module needed**; only the node driver
+  must be ≥ 12.9 (OK on the GH200 nodes).
+- A venv built from a module Python needs **that module loaded at runtime** to find `libpython`, so
+  batch jobs `module load` the same version before running the venv python.
 - **`torch_scatter` / `torch_sparse`** (if a fairchem dep pulls them) have no prebuilt aarch64 wheels →
-  they compile from source: keep the `CUDA/` module loaded and set `export TORCH_CUDA_ARCH_LIST=9.0`
-  (Hopper) before installing.
+  they compile from source: `module load CUDA/12.8.0` and `export TORCH_CUDA_ARCH_LIST=9.0` (Hopper)
+  before installing.
 
-**Outbound internet:** GPU (aarch64) nodes **DO have outbound internet** (confirmed 2026-07-25 — NGC
-image build + `pip install` + gated HF weight download all ran on `gn*`). Build the sandbox + venv
-**once**, then batch jobs reuse it fully offline (`HF_HUB_OFFLINE=1`).
+**This repo automates all of the above** — `scripts/hpc_scripts/adsorbml/setup_perun_uma_env.sh`
+(run once, on a GPU node). It loads the Python module (`PYTHON_MODULE=` knob if the default name is
+wrong), builds `~/envs/uma`, installs the pinned torch + fairchem, warms the gated `uma-m-1p1` weights
+to `/project/${PROJECT_ID}/hf_cache`, and records the module name so the worker reloads it. It also
+handles the broken-`module`-in-subshell issue (see the caveat box).
+
+**Outbound internet:** GPU (aarch64) nodes **DO have outbound internet** (confirmed — `pip install` +
+gated HF weight download run on `gn*`). Build the venv **once**, then batch jobs reuse it fully offline
+(`HF_HUB_OFFLINE=1`).
+
+> **GPU env history — why native, not a container.** The first working env layered fairchem on an
+> NVIDIA NGC PyTorch container (a `--sandbox` dir, because a `.sif` won't mount on the GH200 kernel —
+> "bad superblock … compression"). It kept fighting the container: the image shipped **torch 2.6**, but
+> fairchem needs **~=2.8.0**; installing our own torch 2.8 into the layered venv collided with the
+> container's 2.6 via `LD_LIBRARY_PATH` (`torch/lib` first on the path → `torch._C has no attribute
+> AcceleratorError`). Four such env fights in total. The `torch==2.8.0+cu129` aarch64 wheel provides
+> CUDA-Torch-on-ARM directly, so the container was pure liability — **dropped 2026-08-03** for the
+> native venv above (confirmed `2.8.0+cu129 True` on `gn034`).
 
 ---
 
@@ -291,8 +287,8 @@ sbatch --array=1-"$N"%20 --export=ALL,MANIFEST_PATH="$MANIFEST_PATH" gpaw_array.
 `scancel <jobid>_[1-3]`, `scancel <jobid>`.
 
 ### 7c. GPU job — fairchem / UMA screening (uses the aarch64 env from §3)
-Requires the CUDA-enabled aarch64 env built in §3 (NGC `--sandbox` dir **or** native venv). fairchem
-also uses the GPU via `--nv`; GPAW re-checks the ranked candidates afterward on the CPU partitions (§7b).
+Requires the native CUDA aarch64 venv built in §3. GPAW re-checks the ranked candidates afterward on
+the CPU partitions (§7b).
 ```bash
 #!/usr/bin/env bash
 #SBATCH --job-name=uma-relax
@@ -308,15 +304,9 @@ also uses the GPU via `--nv`; GPAW re-checks the ranked candidates afterward on 
 
 set -euo pipefail
 
-# --- Option A: NGC sandbox container (recommended) ---
-module load singularity/ce-4.4.1
-singularity exec --nv -B /scratch,/project "/project/<id>/containers/pytorch-ngc.dir" \
-    "$HOME/envs/uma/bin/python" -u scripts/adsorbml/1-relax_uma_omat.py --include "Mo2N_*" --workers 1
-
-# --- Option B: native venv (use EITHER A or B, not both) ---
-# module load CUDA/12.8.0
-# source "$HOME/envs/uma-aarch64/bin/activate"
-# python -u scripts/adsorbml/1-relax_uma_omat.py --include "Mo2N_*" --workers 1
+module load Python/3.12.3-GCCcore-13.3.0        # same module the venv was built from (finds libpython)
+source "$HOME/envs/uma/bin/activate"
+python -u scripts/adsorbml/1-relax_uma_omat.py --include "Mo2N_*" --workers 1
 ```
 The rest of the ML pipeline — `2-run_adsorbml.py` (screen H* sites) and `3-extract_rank.py` (rank) —
 runs the same way on GPU; both steps also support SLURM-array sharding (`--shard I/N`, or auto from
@@ -371,21 +361,16 @@ To target Perun, the deltas are:
 - **`--account` may or may not be strictly mandatory** (job-builder marks Project "optional", but
   examples and the repo's DEVANA submitter require it). Always set it; confirm with `sprojects`.
 - **`sreport` is not documented**; use `sacct` / `seff` / `sstat` for usage & efficiency.
-- **GPU/fairchem env is the fragile part, not SLURM** (§3): needs a CUDA-enabled *aarch64* PyTorch;
-  the robust path is the NGC **sandbox** container (plain `pip install torch` is CPU-only). GPU nodes
-  DO have outbound internet (confirmed). Check `torch.cuda.is_available()` before a real run.
-- **`.sif` images WON'T MOUNT on GPU nodes** (confirmed 2026-07-25): the GH200 kernel rejects the
-  squashfs — `FATAL: … kernel reported a bad superblock … possible causes … compression algorithm …`.
-  Build the container as a `--sandbox` DIRECTORY instead — it execs identically and needs no mount.
-  (§3; `scripts/hpc_scripts/adsorbml/setup_perun_uma_env.sh` does this.)
+- **GPU/fairchem env is the fragile part, not SLURM** (§3): needs a CUDA-enabled *aarch64* PyTorch —
+  the working wheel is `torch==2.8.0+cu129` (plain `pip install torch` is CPU-only). GPU nodes DO have
+  outbound internet (confirmed). Check `torch.cuda.is_available()` before a real run. (History of an
+  earlier container approach and why it was dropped: the "GPU env history" note in §3.)
 - **Lmod's `module` is broken in non-login subshells on GPU nodes** (confirmed 2026-07-25): a
   `bash script.sh` / sbatch shell inherits a `module` function that resolves against the wrong-arch
   Lmod tree — `/apps/lmod` (x86) vs `/apps/lmod_gpu` (aarch64) — and fails, printing Lmod's Lua banner
   as shell errors (`… lmod: line N: -- : command not found`, `Copyright (C) …`). Fix: re-source the
   init matching the LIVE launcher, `source "$(dirname "$(dirname "$LMOD_CMD")")/init/bash"`, before
-  `module load` (and wrap it in `set +u`); or skip Lmod and call the binary directly,
-  `/apps/singularity_gpu/bin/singularity`. Both repo Perun scripts already do this.
-- **`/home` is small-quota NFS** — don't stage multi-GB container images there; use `/project` (an
-  ~11 GB image built to `~/containers` truncated silently). The singularity module is
-  `singularity/ce-4.4.1` (bare `singularity` does not resolve).
+  `module load` (and wrap it in `set +u`). The repo's Perun scripts already do this (they need it for
+  `module load Python` in the sbatch worker).
+- **`/home` is small-quota NFS** — keep big data (weights, outputs) on `/project`/`/scratch`, not `/home`.
 - Docs recently moved `nscc.sk` → `hpc.sav.sk`; if a link 404s, swap the host.
