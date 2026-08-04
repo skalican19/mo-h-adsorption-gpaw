@@ -1,38 +1,33 @@
 ---
 name: perun-hpc
-description: How to write and submit SLURM batch scripts to run computations on the Perun HPC cluster (NSCC / HPC SAV). Covers access (ssh, keys), storage layout (/home /project /scratch /work), the environment (no GPAW/VASP/conda modules — bring your own; x86_64 CPU vs aarch64 GPU split), partitions & limits, accounting (--account, sprojects), copy-paste sbatch templates (single CPU, CPU array for GPAW, GPU for fairchem/UMA), and monitoring. Use whenever writing an sbatch script for Perun, choosing a partition, setting up a cluster Python env, transferring data to/from Perun, or porting this repo's DEVANA launchers to Perun.
+description: Generic guide for writing and submitting SLURM batch scripts on the Perun HPC cluster (NSCC / HPC SAV). Covers access (ssh, keys), storage layout (/home /project /scratch /work), the environment (no scientific-software modules — bring your own; x86_64 CPU vs aarch64 GPU split), partitions & limits, accounting (--account, sprojects), copy-paste sbatch templates (single job, CPU array, GPU job), and monitoring. Use whenever writing an sbatch script for Perun, choosing a partition, setting up a cluster Python env, or transferring data to/from Perun.
 ---
 
 # Running computations on Perun (NSCC / HPC SAV)
 
-Guide for writing SLURM batch scripts on the **Perun** cluster. Complements the repo's
-existing DEVANA launchers (`scripts/submit_devana_gpaw_array.sh`,
-`scripts/devana_gpaw_array_worker.sh`, `scripts/setup_pyenv_env.sh`) — Perun is a different,
-newer cluster and needs different partitions and an architecture-aware environment.
+Generic guide for writing SLURM batch scripts on the **Perun** cluster.
 
 **Source:** `https://userdocs.hpc.sav.sk/` (was `userdocs.nscc.sk` — 301-redirects to the new host).
-**Verified 2026-07-21; native UMA/GPU env confirmed on-cluster 2026-08-03.** Docs are a recently-migrated live site; re-check specifics on-cluster
+**Verified 2026-07-21; aarch64 GPU env details confirmed on-cluster 2026-08-03.** Docs are a recently-migrated live site; re-check specifics on-cluster
 (`sinfo`, `sprojects`, `quota -s`, `module avail`) before trusting a number here.
 
 > **⚠️ Read the "Verify on-cluster" box at the bottom first.** Several quota numbers are
-> unpublished, the accounting formula looks inherited from Devana, and the partition table has
-> internal inconsistencies. This guide flags each; don't treat unverified values as ground truth.
+> unpublished, the accounting formula looks inherited from another cluster (Devana), and the
+> partition table has internal inconsistencies. This guide flags each; don't treat unverified
+> values as ground truth.
 
 ---
 
-## 0. TL;DR for this repo
+## 0. TL;DR
 
-- **GPAW** (CPU-only) → `cpu_short` (≤1 day) or `cpu_long` (long jobs). One SLURM **array task
-  per structure**, exactly like the DEVANA workflow. See the CPU-array template below.
-- **fairchem / UMA** (Torch, GPU) → `gpu_short|gpu_medium|gpu_long`. **GPU nodes are ARM/aarch64 (GH200)**
-  and need a **CUDA-enabled aarch64 PyTorch** — plain `pip install torch` is CPU-only; the wheel that
-  works is `torch==2.8.0+cu129` (see §3). Use the repo's
-  `scripts/hpc_scripts/adsorbml/setup_perun_uma_env.sh` (builds a native fairchem venv on a GPU node),
-  then `scripts/hpc_scripts/adsorbml/submit_perun_adsorbml.sh`. Separate env from GPAW's (different arch).
-- **No GPAW / VASP / Anaconda module exists on Perun** → bring your own env (reuse
-  `scripts/setup_pyenv_env.sh`, which already builds libffi/sqlite rootless).
-- Inputs stay in the repo (`/home` or `/project`); point big outputs / `$ADSORBML_DATA_ROOT` at
-  `/scratch/<project_id>` or `/project/<project_id>`; use `/work/$SLURM_JOB_ID` for hot per-job I/O.
+- **No common scientific-software modules** (no GPAW, VASP, Anaconda, etc.) — bring your own
+  Python env. Site modules cover compilers, MPI, math libs, CUDA, and a few named apps (§3).
+- **Architecture split is the #1 gotcha**: login + CPU compute nodes are x86_64; GPU nodes are
+  aarch64 (Grace-Hopper GH200). An env built on one arch will NOT run on the other.
+- **CUDA PyTorch on the GPU nodes needs an aarch64-specific wheel** — a plain `pip install torch`
+  there is CPU-only and silently ignores the GPU. See §3.
+- Keep code/small inputs on `/home` or `/project`; point large/temp outputs at
+  `/scratch/<project_id>`; use `/work/$SLURM_JOB_ID` for hot per-job I/O.
 - **`--account=<project_id>` on every job.** Get the id from `sprojects -f`.
 
 ---
@@ -76,7 +71,7 @@ Check usage: `quota -s`, `du -sh /project/<id>/`, `sprojects -f`.
 
 **There is no GPAW, VASP, or Anaconda module on Perun.** Site modules include Python 3.10–3.14,
 GCC, Intel, OpenMPI/IntelMPI, FFTW, HDF5, MKL, CUDA, and (CPU nodes only) Quantum ESPRESSO 7.5 /
-VASP 6.5.1 / SIESTA. For GPAW + fairchem you supply the Python env yourself.
+VASP 6.5.1 / SIESTA. Beyond that, you supply the Python env yourself.
 
 **Lmod:**
 ```bash
@@ -90,72 +85,62 @@ module list ; module purge      # ml = alias for module
 - **Login + CPU compute nodes = x86_64** (AMD EPYC Turin).
 - **GPU nodes = aarch64 / ARM** (Grace-Hopper GH200).
 - **A venv/conda env built on the login node will NOT run on the GPU nodes**, and vice versa.
-  - GPAW / CPU work → build the env on the **login node** (x86_64); it runs on `cn*`.
-  - fairchem / UMA / Torch → build the env **on a GPU node** (aarch64 wheels). This is the fiddly
-    part — see the dedicated **"GPU env for fairchem / UMA"** subsection below.
+  - CPU-only work → build the env on the **login node** (x86_64); it runs on `cn*`.
+  - GPU/CUDA work → build the env **on a GPU node** (aarch64 wheels). This is the fiddly part —
+    see the dedicated **"GPU env"** subsection below.
 
 **Python env options**
-- **Reuse the repo bootstrap** (recommended for GPAW): `bash scripts/setup_pyenv_env.sh` — it builds
-  a pyenv Python with a rootless libffi/sqlite fallback (handles header-less clusters) and installs
-  `requirements.txt`. Run it once on the login node for the CPU env.
 - **venv:** `module load Python/<ver>` → `python3 -m venv <dir>` → `source <dir>/bin/activate`.
-  In batch scripts, **load the same Python module** before sourcing the venv (version must match).
+  In batch scripts, **load the same Python module** before sourcing the venv (version must match)
+  — a venv built from a module Python needs that module loaded at runtime to find `libpython`.
 - **conda:** install Miniconda manually (`Miniconda3-latest-Linux-x86_64.sh` for login/CPU,
   `-aarch64.sh` on a GPU node). One env per project; keep base minimal.
-- If a batch/nohup shell strips library paths, export before running Python (see `setup_pyenv_env.sh`):
-  `export LD_LIBRARY_PATH="$HOME/.local/mo_h_bootstrap/lib64:$HOME/.local/mo_h_bootstrap/lib:$LD_LIBRARY_PATH"`
+- If your Python build needed a rootless libffi/sqlite fallback (common on header-less nodes) and a
+  batch/nohup shell strips library paths, export `LD_LIBRARY_PATH` to include those lib dirs before
+  running Python.
 
-### GPU env for fairchem / UMA — the hard part (aarch64 + CUDA PyTorch)
+### GPU env — CUDA / PyTorch on aarch64 (the hard part)
 
-GPU screening on Perun means running Torch/fairchem on the **aarch64 (ARM)** Grace-Hopper GH200
-nodes (CUDA compute capability **9.0**). The trap: **a plain `pip install torch` on aarch64 installs
-a CPU-only build that silently ignores the GPU** — and fairchem-core pins **`torch~=2.8.0`**, whose
-only aarch64 CUDA wheel lives on the **cu129** index (cu128 skips 2.8). Build the env **on a GPU node**
-so wheels match the arch; `setup_pyenv_env.sh` is for the CPU/GPAW env and will NOT produce a CUDA
-Torch here.
+GPU work on Perun means running on the **aarch64 (ARM)** Grace-Hopper GH200 nodes (CUDA compute
+capability **9.0**). The trap: **a plain `pip install torch` on aarch64 installs a CPU-only build
+that silently ignores the GPU.** As of writing, the aarch64 CUDA wheel for torch 2.8 lives on the
+**cu129** index (cu128 skips 2.8) — check `https://download.pytorch.org/whl/` for whatever the
+current equivalent is when you hit this; a CPU-only env built on the login node will NOT produce a
+CUDA torch here regardless.
 
 Land on a GPU node first (interactive):
 ```bash
 srun --partition=gpu_short --gres=gpu:1 --time=02:00:00 --pty bash    # aarch64 shell with a GPU
 ```
 
-**Native aarch64 venv (what this repo uses):**
+**Native aarch64 venv pattern:**
 ```bash
-module load Python/3.12.3-GCCcore-13.3.0             # fairchem needs Python 3.11–3.13
-python -m venv ~/envs/uma && source ~/envs/uma/bin/activate
+module load Python/3.12.3-GCCcore-13.3.0     # match whatever version your CUDA stack needs
+python -m venv ~/envs/myenv && source ~/envs/myenv/bin/activate
 pip install --upgrade pip
-# torch FIRST, from cu129 — the only aarch64 CUDA torch-2.8 wheel; installing fairchem
-# first would drag in a CPU-only torch off PyPI:
+# torch FIRST, from the CUDA-enabled aarch64 index — installing other packages first can drag in
+# a CPU-only torch off PyPI instead:
 pip install --index-url https://download.pytorch.org/whl/cu129 "torch==2.8.0+cu129"
-pip install fairchem-core fairchem-data-oc
-python -c "import torch; print(torch.__version__, torch.cuda.is_available())"   # expect: 2.8.0+cu129 True
+pip install <the rest of your GPU-dependent packages>
+python -c "import torch; print(torch.__version__, torch.cuda.is_available())"   # expect: ..., True
 ```
 - The cu129 wheel bundles its own CUDA runtime — **no `CUDA/` module needed**; only the node driver
-  must be ≥ 12.9 (OK on the GH200 nodes).
+  must be new enough (fine on the GH200 nodes as of writing).
 - A venv built from a module Python needs **that module loaded at runtime** to find `libpython`, so
-  batch jobs `module load` the same version before running the venv python.
-- **`torch_scatter` / `torch_sparse`** (if a fairchem dep pulls them) have no prebuilt aarch64 wheels →
-  they compile from source: `module load CUDA/12.8.0` and `export TORCH_CUDA_ARCH_LIST=9.0` (Hopper)
-  before installing.
-
-**This repo automates all of the above** — `scripts/hpc_scripts/adsorbml/setup_perun_uma_env.sh`
-(run once, on a GPU node). It loads the Python module (`PYTHON_MODULE=` knob if the default name is
-wrong), builds `~/envs/uma`, installs the pinned torch + fairchem, warms the gated `uma-m-1p1` weights
-to `/project/${PROJECT_ID}/hf_cache`, and records the module name so the worker reloads it. It also
-handles the broken-`module`-in-subshell issue (see the caveat box).
-
-**Outbound internet:** GPU (aarch64) nodes **DO have outbound internet** (confirmed — `pip install` +
-gated HF weight download run on `gn*`). Build the venv **once**, then batch jobs reuse it fully offline
-(`HF_HUB_OFFLINE=1`).
-
-> **GPU env history — why native, not a container.** The first working env layered fairchem on an
-> NVIDIA NGC PyTorch container (a `--sandbox` dir, because a `.sif` won't mount on the GH200 kernel —
-> "bad superblock … compression"). It kept fighting the container: the image shipped **torch 2.6**, but
-> fairchem needs **~=2.8.0**; installing our own torch 2.8 into the layered venv collided with the
-> container's 2.6 via `LD_LIBRARY_PATH` (`torch/lib` first on the path → `torch._C has no attribute
-> AcceleratorError`). Four such env fights in total. The `torch==2.8.0+cu129` aarch64 wheel provides
-> CUDA-Torch-on-ARM directly, so the container was pure liability — **dropped 2026-08-03** for the
-> native venv above (confirmed `2.8.0+cu129 True` on `gn034`).
+  batch jobs must `module load` the same version before running the venv python.
+- Packages with no prebuilt aarch64 wheels (some torch extension libraries, e.g. `torch_scatter` /
+  `torch_sparse`) compile from source → `module load CUDA/<ver>` and
+  `export TORCH_CUDA_ARCH_LIST=9.0` (Hopper) before installing.
+- **Outbound internet:** GPU (aarch64) nodes **do have outbound internet** (confirmed — `pip
+  install` and gated-model downloads both work on `gn*`). Build the venv once, then batch jobs can
+  run fully offline afterward if your workload supports it (e.g. `HF_HUB_OFFLINE=1` for
+  HuggingFace-gated models).
+- **Containers:** a `.sif`/Singularity image built for x86_64 won't run here, and on at least one
+  occasion a `.sif` failed to even mount on the GH200 kernel ("bad superblock … compression").
+  Layering a GPU-python-stack container also risks the container's own CUDA/PyTorch build colliding
+  with anything you `pip install` on top, via `LD_LIBRARY_PATH` ordering (`torch/lib` from the
+  container winning over your own venv's). A native venv (above) sidesteps both problems — prefer
+  it unless you have a specific reason to containerize.
 
 ---
 
@@ -240,58 +225,53 @@ srun --partition=cpu_short --nodes=1 --ntasks=8 --time=02:00:00 --pty bash   # i
 #SBATCH --partition=cpu_short
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=11          # matches repo CORES_PER_CALC
+#SBATCH --cpus-per-task=8
 #SBATCH --mem-per-cpu=4G
 #SBATCH --time=12:00:00
 #SBATCH --output=%x.%j.out
 #SBATCH --error=%x.%j.err
 
 set -euo pipefail
-source "$HOME/.pyenv/versions/cemea-env/bin/activate"   # or: module load Python/... ; source venv/bin/activate
+module load Python/3.12.3-GCCcore-13.3.0   # or: source /path/to/your/venv/bin/activate
 export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK}
-python -u scripts/gpaw_h_adsorption.py --structure-name Mo2N_slab --workers 1 \
-       --cores-per-calc "${SLURM_CPUS_PER_TASK}"
+python -u your_script.py --workers 1 --cores "${SLURM_CPUS_PER_TASK}"
 ```
 
-### 7b. CPU array — one task per structure (GPAW; mirrors the DEVANA workflow)
-This is the primary pattern. Build a manifest (one structure name per line) exactly as
-`submit_devana_gpaw_array.sh` does via `gpaw_h_adsorption.py --write-structure-list`, then:
+### 7b. CPU array job — one task per work item
+The general pattern for embarrassingly-parallel CPU work: build a manifest (one work-item id per
+line), then:
 ```bash
 #!/usr/bin/env bash
-#SBATCH --job-name=gpaw-perun
+#SBATCH --job-name=cpu-array
 #SBATCH --account=<project_id>
-#SBATCH --partition=cpu_short          # cpu_long for jobs > 1 day
+#SBATCH --partition=cpu_short          # cpu_long for jobs beyond the short-partition time limit
 #SBATCH --nodes=1
-#SBATCH --cpus-per-task=11             # CORES_PER_CALC
-#SBATCH --mem-per-cpu=4G               # ≈ RAM_PER_CALC_GB
+#SBATCH --cpus-per-task=8
+#SBATCH --mem-per-cpu=4G
 #SBATCH --time=24:00:00
-#SBATCH --array=1-350%20               # %20 = at most 20 tasks running at once
+#SBATCH --array=1-100%20               # %20 = at most 20 tasks running at once
 #SBATCH --output=logs/%x_%A_%a.out
 #SBATCH --error=logs/%x_%A_%a.err
 
 set -euo pipefail
-source "$HOME/.pyenv/versions/cemea-env/bin/activate"
-# resolve this task's structure from the manifest (1 line = 1 structure)
-STRUCTURE_NAME="$(sed -n "${SLURM_ARRAY_TASK_ID}p" "${MANIFEST_PATH:?set MANIFEST_PATH via --export}")"
-echo "[$(date -Is)] task ${SLURM_ARRAY_TASK_ID}: ${STRUCTURE_NAME} on $(hostname)"
-python -u scripts/gpaw_h_adsorption.py \
-    --structure-name "${STRUCTURE_NAME}" --workers 1 \
-    --cores-per-calc "${SLURM_CPUS_PER_TASK}" --relax-steps 200 --fmax 0.03
+source /path/to/your/venv/bin/activate
+ITEM="$(sed -n "${SLURM_ARRAY_TASK_ID}p" "${MANIFEST_PATH:?set MANIFEST_PATH via --export}")"
+echo "[$(date -Is)] task ${SLURM_ARRAY_TASK_ID}: ${ITEM} on $(hostname)"
+python -u your_script.py --item "${ITEM}" --cores "${SLURM_CPUS_PER_TASK}"
 ```
 Submit with the manifest path exported and `--array` sized to its line count:
 ```bash
 N=$(wc -l < "$MANIFEST_PATH")
-sbatch --array=1-"$N"%20 --export=ALL,MANIFEST_PATH="$MANIFEST_PATH" gpaw_array.sh
+sbatch --array=1-"$N"%20 --export=ALL,MANIFEST_PATH="$MANIFEST_PATH" my_array.sh
 ```
 `--array` forms: `1-8`, `1,3,9`, `1-7:2` (step), `1-100%10` (throttle). Cancel one/all:
 `scancel <jobid>_[1-3]`, `scancel <jobid>`.
 
-### 7c. GPU job — fairchem / UMA screening (uses the aarch64 env from §3)
-Requires the native CUDA aarch64 venv built in §3. GPAW re-checks the ranked candidates afterward on
-the CPU partitions (§7b).
+### 7c. GPU job
+Requires the native aarch64 venv built in §3.
 ```bash
 #!/usr/bin/env bash
-#SBATCH --job-name=uma-relax
+#SBATCH --job-name=gpu-job
 #SBATCH --account=<project_id>
 #SBATCH --partition=gpu_short          # gpu_medium/long for longer runs
 #SBATCH --nodes=1
@@ -303,14 +283,10 @@ the CPU partitions (§7b).
 #SBATCH --error=logs/%x_%j.err
 
 set -euo pipefail
-
-module load Python/3.12.3-GCCcore-13.3.0        # same module the venv was built from (finds libpython)
-source "$HOME/envs/uma/bin/activate"
-python -u scripts/adsorbml/1-relax_uma_omat.py --include "Mo2N_*" --workers 1
+module load Python/3.12.3-GCCcore-13.3.0   # same module the venv was built from (finds libpython)
+source ~/envs/myenv/bin/activate
+python -u your_gpu_script.py --workers 1
 ```
-The rest of the ML pipeline — `2-run_adsorbml.py` (screen H* sites) and `3-extract_rank.py` (rank) —
-runs the same way on GPU; both steps also support SLURM-array sharding (`--shard I/N`, or auto from
-`SLURM_ARRAY_TASK_ID`/`COUNT`) if you want to fan the screening across many GPU tasks.
 
 ---
 
@@ -329,48 +305,27 @@ memory above ~3450 MB/CPU pushes the BU up via the `GB*0.256` term).
 
 ---
 
-## 9. Porting this repo's DEVANA scripts to Perun
-
-The DEVANA launchers already encode the right pattern (manifest → array → worker → pyenv env).
-To target Perun, the deltas are:
-- **Partition:** DEVANA `PARTITION=cpu` → Perun `cpu_short` (default) or `cpu_long`. GPU work →
-  `gpu_short|gpu_medium|gpu_long`.
-- **Env:** run `scripts/setup_pyenv_env.sh` once on the **login node** (x86_64) for the GPAW/CPU env;
-  build any fairchem/UMA env **on a GPU node** (aarch64). Keep the `LD_LIBRARY_PATH` bootstrap export.
-- **Walltime:** cap per partition (`cpu_short` ≤ 1 day; use `cpu_long` beyond that — verify the max).
-- **Storage:** set `$ADSORBML_DATA_ROOT` to `/scratch/<id>` (staging) or `/project/<id>` (keep),
-  and copy finals off `/scratch` before job end. Inputs stay in the repo.
-- Everything else (`--account`, `--array=1-N`, `SLURM_ARRAY_TASK_ID`→structure, `--export=ALL,...`)
-  carries over unchanged.
-
-*(Perun launchers now exist for the UMA/fairchem GPU path, under `scripts/hpc_scripts/adsorbml/`:
-`setup_perun_uma_env.sh`, `submit_perun_adsorbml.sh`, `perun_adsorbml_worker.sh`. A GPAW
-`submit_perun_gpaw_array.sh` + worker is still TODO — use the §7b template until then.)*
-
----
-
 ## ⚠️ Verify on-cluster (docs gaps & inconsistencies)
 
 - **Quotas for Perun `/home`, `/project`, `/scratch` are unpublished** ("content will be added").
-  Get real numbers with `quota -s` and `sprojects -f`; don't assume the Devana values.
-- **BU/billing formula appears inherited from Devana** (its doc example is headed "Devana nodes, 64
-  cores"). Confirm Perun charging before estimating core-hour cost.
+  Get real numbers with `quota -s` and `sprojects -f`; don't assume another cluster's values.
+- **BU/billing formula appears inherited from another cluster** (its doc example is headed "Devana
+  nodes, 64 cores"). Confirm Perun charging before estimating core-hour cost.
 - **Partition table inconsistencies:** `cpu_long` is listed with a 4-day limit but prose elsewhere
   says CPU max is 2 days; the "Memory (GB)" column doesn't match per-node RAM. Trust `sinfo` /
   `scontrol show partition` and the per-CPU MB figures over the table.
 - **`--account` may or may not be strictly mandatory** (job-builder marks Project "optional", but
-  examples and the repo's DEVANA submitter require it). Always set it; confirm with `sprojects`.
+  examples elsewhere require it). Always set it; confirm with `sprojects`.
 - **`sreport` is not documented**; use `sacct` / `seff` / `sstat` for usage & efficiency.
-- **GPU/fairchem env is the fragile part, not SLURM** (§3): needs a CUDA-enabled *aarch64* PyTorch —
-  the working wheel is `torch==2.8.0+cu129` (plain `pip install torch` is CPU-only). GPU nodes DO have
-  outbound internet (confirmed). Check `torch.cuda.is_available()` before a real run. (History of an
-  earlier container approach and why it was dropped: the "GPU env history" note in §3.)
+- **GPU/CUDA env is the fragile part, not SLURM** (§3): needs a CUDA-enabled *aarch64* PyTorch — the
+  working wheel as of writing is `torch==2.8.0+cu129` (plain `pip install torch` is CPU-only). GPU
+  nodes DO have outbound internet (confirmed). Check `torch.cuda.is_available()` before a real run.
 - **Lmod's `module` is broken in non-login subshells on GPU nodes** (confirmed 2026-07-25): a
   `bash script.sh` / sbatch shell inherits a `module` function that resolves against the wrong-arch
   Lmod tree — `/apps/lmod` (x86) vs `/apps/lmod_gpu` (aarch64) — and fails, printing Lmod's Lua banner
   as shell errors (`… lmod: line N: -- : command not found`, `Copyright (C) …`). Fix: re-source the
   init matching the LIVE launcher, `source "$(dirname "$(dirname "$LMOD_CMD")")/init/bash"`, before
-  `module load` (and wrap it in `set +u`). The repo's Perun scripts already do this (they need it for
-  `module load Python` in the sbatch worker).
+  `module load` (and wrap it in `set +u`) — derive the path from `$LMOD_CMD`, not `$LMOD_PKG`/
+  `$MODULESHOME`, since those can point at the wrong-arch tree here.
 - **`/home` is small-quota NFS** — keep big data (weights, outputs) on `/project`/`/scratch`, not `/home`.
 - Docs recently moved `nscc.sk` → `hpc.sav.sk`; if a link 404s, swap the host.
