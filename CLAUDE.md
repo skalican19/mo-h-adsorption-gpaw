@@ -27,9 +27,10 @@ from git history if the Paper-B validation work resumes.)
 
 ```
 scripts/
+  _common.py                  # dependency-free helpers shared by BOTH pipelines (discover_structures)
   generate_structures.py     # build all POSCARs under data/inputs/VASP_inputs/<name>/
   gpaw_h_adsorption.py        # PRIMARY calculator; 3 modes (see CLI flags below)
-  adsorbml/                   # ML screening pipeline (steps 1-3) + _common.py
+  adsorbml/                   # ML screening pipeline (steps 1-3) + its own _common.py (adsorbml-specific helpers)
   hpc_scripts/adsorbml/       # Perun GPU launchers for the AdsorbML pipeline
                               #   (setup_perun_uma_env.sh, submit_perun_adsorbml.sh, perun_adsorbml_worker.sh)
   compute_h_adsorption.py     # LEGACY: Materials Project + VASP input templating
@@ -43,7 +44,9 @@ data/
   uma_relaxed/<name>.traj     # AdsorbML step-1 relaxed slabs
   adsorbml_manifest.csv       # AdsorbML step-1 -> step-2 handoff
   adsorbml_results/<name>/    # candidates.csv + candidate_*.traj; ranked_candidates*.csv
-requirements.txt              # ase, numpy, pandas, gpaw, pymatgen, fairchem-core, fairchem-data-oc
+requirements.txt              # includes requirements-gpaw.txt + requirements-adsorbml.txt (union, for the unified dev env)
+requirements-gpaw.txt         # ase, numpy, pandas, gpaw, pymatgen — standard DFT path + generate_structures.py
+requirements-adsorbml.txt     # ase, numpy, pandas, fairchem-core, fairchem-data-oc — ML screening path (no gpaw)
 ```
 
 ## Key settings (in `scripts/gpaw_h_adsorption.py`, top of file)

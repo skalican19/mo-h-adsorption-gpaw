@@ -134,8 +134,12 @@ source "${UMA_ENV}/bin/activate"
 log "Installing ${TORCH_SPEC} from ${TORCH_INDEX_URL}"
 python -m pip install --upgrade pip
 python -m pip install --index-url "${TORCH_INDEX_URL}" "${TORCH_SPEC}"
-log "Installing fairchem-core + fairchem-data-oc"
-python -m pip install fairchem-core fairchem-data-oc
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+log "Installing requirements-adsorbml.txt (${REPO_ROOT}/requirements-adsorbml.txt)"
+# Deliberately NOT the full requirements.txt: gpaw is DFT-only, never runs on
+# this GPU node, and (being source-only) needs a BLAS/libxc/C++ toolchain that
+# isn't set up here. The AdsorbML pipeline doesn't import it.
+python -m pip install -r "${REPO_ROOT}/requirements-adsorbml.txt"
 
 # --- 5. Verify GPU + warm the gated HF weight cache -------------------------
 mkdir -p "${HF_HOME}"

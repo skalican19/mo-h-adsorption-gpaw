@@ -34,15 +34,15 @@ from ase.io import read
 from ase.optimize import LBFGS
 from ase.constraints import FixAtoms
 
-# Shared helpers (sibling module) + discover_structures (parent scripts/ dir)
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _common import (
+# scripts/ on the path makes "adsorbml" resolve as a namespace package, so
+# adsorbml._common and _common get distinct sys.modules keys (no basename clash).
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from _common import discover_structures
+from adsorbml._common import (
     DATA_INPUTS, UMA_RELAXED, MANIFEST_CSV, FMAX, MAX_STEPS,
     setup_logging, millers_from_name, get_shard, apply_shard,
     write_atomic_csv, write_atomic_traj, run_gpu_workers,
 )
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from gpaw_h_adsorption import discover_structures
 
 # Structures excluded from AdsorbML (not 2D-periodic surface slabs or off-topic)
 _EXCLUDE = ("graphene", "nanoribbon", "edge")

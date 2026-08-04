@@ -8,11 +8,12 @@ set -euo pipefail
 #   bash scripts/setup_pyenv_env.sh
 #   ENV_NAME=cemea-env PYTHON_VERSION=3.10.16 bash scripts/setup_pyenv_env.sh
 #   INSTALL_SYSTEM_DEPS=1 bash scripts/setup_pyenv_env.sh
+#   REQ_FILE=requirements-gpaw.txt bash scripts/setup_pyenv_env.sh   # GPAW-only (e.g. Perun login node)
 
 ENV_NAME="${ENV_NAME:-cemea-env}"
 PYTHON_VERSION="${PYTHON_VERSION:-3.10.16}"
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-REQ_FILE="${PROJECT_ROOT}/requirements.txt"
+REQ_FILE="${REQ_FILE:-${PROJECT_ROOT}/requirements.txt}"
 INSTALL_SYSTEM_DEPS="${INSTALL_SYSTEM_DEPS:-0}"
 BOOTSTRAP_PREFIX="${BOOTSTRAP_PREFIX:-${HOME}/.local/mo_h_bootstrap}"
 LIBFFI_VERSION="${LIBFFI_VERSION:-3.4.6}"

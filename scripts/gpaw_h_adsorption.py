@@ -21,7 +21,6 @@ import json
 import signal
 import fcntl
 import argparse
-import fnmatch
 import time
 import sys
 import numpy as np
@@ -34,6 +33,8 @@ from gpaw import GPAW, PW
 from ase.optimize import BFGS
 from ase.constraints import FixAtoms
 from datetime import datetime
+
+from _common import discover_structures
 
 # Paths
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -228,36 +229,6 @@ def _make_row(formula, surface, *, e_clean=None, e_with_h=None, e_h2=None,
         status,
         timestamp if timestamp is not None else datetime.now().isoformat(),
     ]
-
-
-def discover_structures(base_dir, include_patterns=None):
-    """Discover all POSCAR files under base_dir and return labels.
-
-    Args:
-        base_dir: directory containing structure subdirectories
-        include_patterns: optional list of glob patterns (e.g. ["Ni_Mo2C_*", "Mo2N_*"]).
-            If provided, only directories matching at least one pattern are included.
-    """
-    base_path = Path(base_dir)
-    if not base_path.exists():
-        return []
-
-    items = []
-    for entry in sorted(base_path.iterdir()):
-        if not entry.is_dir():
-            continue
-        poscar = entry / "POSCAR"
-        if not poscar.exists():
-            continue
-        # Apply include filter
-        if include_patterns:
-            if not any(fnmatch.fnmatch(entry.name, pat) for pat in include_patterns):
-                continue
-        parts = entry.name.split("_", 1)
-        formula = parts[0]
-        surface = parts[1] if len(parts) > 1 else "unknown"
-        items.append((formula, surface, entry))
-    return items
 
 
 def filter_structures_by_name(structures, selected_names):
