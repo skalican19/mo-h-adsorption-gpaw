@@ -6,9 +6,15 @@ build a manifest CSV for the next step.
 
 Excluded: structures with 'graphene', 'nanoribbon', or 'edge' in their name.
 
+Relaxation uses BestFrameLBFGS (see adsorbml/_common.py): the lowest-fmax frame is
+kept rather than the last one, and convergence flags land in atoms.info and in the
+manifest, so "converged" and "ran out of steps" stay distinguishable downstream.
+
 Outputs:
-  <data>/uma_relaxed/<name>.traj   — relaxed slab per structure
-  <data>/adsorbml_manifest.csv     — manifest for 2-run_adsorbml.py
+  <data>/uma_relaxed/<name>.traj   — relaxed slab per structure (+ relax_* in atoms.info)
+  <data>/uma_relaxed/<name>_opt.log — per-step optimizer log
+  <data>/adsorbml_manifest.csv     — manifest for 2-run_adsorbml.py, incl.
+                                     relax_converged / relax_nsteps / relax_fmax
 
 `<data>` is the repo's data/ dir, or $ADSORBML_DATA_ROOT if set (HPC scratch).
 
@@ -16,6 +22,7 @@ Usage (local — one command; manifest written automatically):
   python scripts/adsorbml/1-relax_uma_omat.py
   python scripts/adsorbml/1-relax_uma_omat.py --include "MoS2_*,Mo2N_*"
   python scripts/adsorbml/1-relax_uma_omat.py --workers 2
+  python scripts/adsorbml/1-relax_uma_omat.py --overwrite   # re-relax slabs already done
 
 Usage (HPC SLURM array — shard the relax, then build the manifest ONCE):
   # each array task, e.g. sbatch --array=0-7 :
@@ -31,15 +38,16 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from ase.io import read
-from ase.optimize import LBFGS
 from ase.constraints import FixAtoms
+from ase.calculators.singlepoint import SinglePointCalculator
 
 # scripts/ on the path makes "adsorbml" resolve as a namespace package, so
 # adsorbml._common and _common get distinct sys.modules keys (no basename clash).
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from _common import discover_structures
 from adsorbml._common import (
-    DATA_INPUTS, UMA_RELAXED, MANIFEST_CSV, FMAX, MAX_STEPS,
+    DATA_INPUTS, UMA_RELAXED, MANIFEST_CSV, FMAX, MAX_STEPS_SLAB,
+    BestFrameLBFGS, relax_outcome,
     setup_logging, millers_from_name, get_shard, apply_shard,
     write_atomic_csv, write_atomic_traj, run_gpu_workers,
 )
@@ -69,13 +77,15 @@ def _tag_atoms(atoms):
     return atoms
 
 
-def _relax_one(name: str, poscar_path: Path, calc) -> None:
+def _relax_one(name: str, poscar_path: Path, calc, overwrite: bool = False) -> None:
     log = logging.getLogger(f"relax.{name}")
     out_traj = UMA_RELAXED / f"{name}.traj"
 
-    if out_traj.exists():
+    if out_traj.exists() and not overwrite:
         log.info(f"SKIP (already done): {name}")
         return
+    if out_traj.exists():
+        log.info(f"OVERWRITE: recomputing {name} (existing traj will be replaced)")
 
     log.info(f"Start: {name}")
     try:
@@ -84,32 +94,67 @@ def _relax_one(name: str, poscar_path: Path, calc) -> None:
         atoms = _tag_atoms(atoms)
         atoms.set_constraint(FixAtoms(mask=[t == 0 for t in atoms.get_tags()]))
         atoms.calc = calc
-        opt = LBFGS(atoms, logfile=str(UMA_RELAXED / f"{name}_opt.log"))
-        opt.run(fmax=FMAX, steps=MAX_STEPS)
-        write_atomic_traj(atoms, out_traj)
-        log.info(f"Done: {name}  E={atoms.get_potential_energy():.4f} eV")
+
+        # BestFrameLBFGS keeps the lowest-fmax frame (plain LBFGS can end worse than
+        # it started) and stamps the convergence flags into atoms.info. On return the
+        # live atoms IS the kept frame, so the energy/forces below describe it.
+        opt = BestFrameLBFGS(atoms, logfile=str(UMA_RELAXED / f"{name}_opt.log"))
+        opt.run(fmax=FMAX, steps=MAX_STEPS_SLAB)
+
+        energy = float(atoms.get_potential_energy())
+        snapshot = atoms.copy()                     # keeps tags, constraints, info
+        snapshot.calc = SinglePointCalculator(
+            snapshot, energy=energy, forces=atoms.get_forces()
+        )
+        write_atomic_traj(snapshot, out_traj)
+
+        info = atoms.info
+        log.info(
+            f"Done: {name}  {relax_outcome(info)}  E={energy:.4f} eV  "
+            f"fmax={info['relax_fmax']:.4f} eV/Å (target {FMAX}, "
+            f"kept step {info['relax_best_step']}/{info['relax_nsteps']}, "
+            f"final step fmax={info['relax_fmax_final']:.4f})"
+        )
     except Exception as exc:
         log.error(f"Failed {name}: {exc}")
 
 
 def _relax_task(item, calc) -> None:
-    """Worker adapter: unpack a (name, poscar_path) queue item."""
-    name, poscar_path = item
-    _relax_one(name, Path(poscar_path), calc)
+    """Worker adapter: unpack a (name, poscar_path, overwrite) queue item."""
+    name, poscar_path, overwrite = item
+    _relax_one(name, Path(poscar_path), calc, overwrite=overwrite)
 
 
 def _write_manifest(tasks: list) -> None:
+    """Rebuild the manifest from the trajs on disk, carrying the relaxation quality
+    flags stamped into atoms.info by _relax_one. Trajs written before those flags
+    existed report NaN/None — treat them as unknown, not as converged."""
     rows = []
     for name, _ in tasks:
         traj = UMA_RELAXED / f"{name}.traj"
-        if traj.exists():
-            rows.append({
-                "slab_name": name,
-                "slab_file": str(traj),
-                "millers":   str(millers_from_name(name)),
-            })
-    write_atomic_csv(pd.DataFrame(rows), MANIFEST_CSV)
+        if not traj.exists():
+            continue
+        try:
+            info = read(str(traj)).info
+        except Exception:
+            info = {}
+        rows.append({
+            "slab_name":       name,
+            "slab_file":       str(traj),
+            "millers":         str(millers_from_name(name)),
+            "relax_converged": info.get("relax_converged"),
+            "relax_nsteps":    info.get("relax_nsteps"),
+            "relax_fmax":      info.get("relax_fmax", float("nan")),
+            "relax_best_step": info.get("relax_best_step"),
+        })
+    df = pd.DataFrame(rows)
+    write_atomic_csv(df, MANIFEST_CSV)
     print(f"Manifest written: {MANIFEST_CSV} ({len(rows)} entries)")
+    if len(df):
+        conv    = (df["relax_converged"] == True).sum()   # noqa: E712 — None/NaN must not count
+        unknown = df["relax_converged"].isna().sum()
+        print(f"  converged: {conv}  |  not converged: {len(df) - conv - unknown}  "
+              f"|  unknown (pre-flag traj): {unknown}")
 
 
 def main():
@@ -123,6 +168,10 @@ def main():
                              "(default: from SLURM_ARRAY_TASK_ID, else the whole set).")
     parser.add_argument("--manifest-only", action="store_true",
                         help="Skip relaxation; just (re)build the manifest from existing trajs.")
+    parser.add_argument("--overwrite", action="store_true",
+                        help="Recompute even if <name>.traj already exists (replaces it). "
+                             "Without this, existing trajs are skipped, so a methodology "
+                             "change has no effect on structures already relaxed.")
     args = parser.parse_args()
 
     setup_logging()
@@ -140,15 +189,16 @@ def main():
         return
 
     pending = [(name, path) for name, path in tasks
-               if not (UMA_RELAXED / f"{name}.traj").exists()]
+               if args.overwrite or not (UMA_RELAXED / f"{name}.traj").exists()]
     shard = get_shard(args.shard)
     pending = apply_shard(pending, shard)
 
     print(f"Structures: {len(tasks)} total  |  shard {shard[0]}/{shard[1]}  |  "
-          f"{len(pending)} to run in this shard")
+          f"{len(pending)} to run in this shard"
+          f"{'  |  OVERWRITE: existing trajs will be replaced' if args.overwrite else ''}")
 
     run_gpu_workers(
-        [(name, str(path)) for name, path in pending],
+        [(name, str(path), args.overwrite) for name, path in pending],
         task_name="omat",
         process_item=_relax_task,
         n_workers=args.workers,

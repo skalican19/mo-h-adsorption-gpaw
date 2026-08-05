@@ -26,10 +26,17 @@ Slabs are then ranked across the dataset by |ΔG*H| (closeness to thermoneutral)
 which is the legitimate Sabatier ranking once each slab's value is physical.
 
 A physical sanity window [--emin, --emax] discards exploded/dissociated/
-absorbed placements (e.g. E_ads ≈ -132 eV) that the AdsorbML 'anomalies' field
-did not catch (it is empty for the entire dataset). Every per-slab outcome is
-recorded with a quality_flag and the discarded raw extremum, so nothing is
-hidden.
+absorbed placements (e.g. E_ads ≈ -132 eV) that the AdsorbML 'anomalies' column
+did not catch (that column is always empty by construction — run_adsorbml returns
+only anomaly-free candidates; the rejected ones are in <slab>/anomalies.csv).
+Every per-slab outcome is recorded with a quality_flag and the discarded raw
+extremum, so nothing is hidden.
+
+RELAXATION QUALITY IS REPORTED, NOT FILTERED ON. The selection rule above is
+unchanged, so a candidate whose relaxation never converged can still top the
+ranking. Fmax_slab/Fmax_adslab, slab_converged/adslab_converged and the step
+counts are carried into the output CSV so that can be checked; results predating
+2026-08 have no such data and read as 'unknown', never as converged.
 
 Reads:  data/adsorbml_results/<name>/candidates.csv
         data/adsorbml_manifest.csv  (for slab_file paths)
@@ -57,6 +64,33 @@ from _common import (
 )
 
 DEFAULT_OUT = OUT_DIR / "ranked_candidates_stable.csv"
+
+
+def _get(row, key) -> float:
+    """Numeric field from a Series-like row, NaN if absent/missing/unparseable.
+
+    Convergence data is absent for pre-2026-08 results (no columns at all), so every
+    read must degrade to 'unknown' rather than to a default that reads as converged.
+    """
+    if row is None or key not in row:
+        return float("nan")
+    try:
+        value = float(row[key])
+    except (TypeError, ValueError):
+        return float("nan")
+    return value
+
+
+def _flag(row, key):
+    """Tri-state convergence flag: True / False / None (= unknown, never 'converged')."""
+    if row is None or key not in row:
+        return None
+    value = row[key]
+    if isinstance(value, str):
+        return {"true": True, "false": False}.get(value.strip().lower())
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return None
+    return bool(value)
 
 
 def _select_best(df, select, emin, emax):
@@ -145,10 +179,18 @@ def main():
             print(f"  WARN {slab_name}: could not read H position: {exc}")
             h_pos = [float("nan")] * 3
 
-        slab_file = (
-            manifest.loc[slab_name, "slab_file"]
-            if slab_name in manifest.index else ""
-        )
+        mrow = manifest.loc[slab_name] if slab_name in manifest.index else None
+        slab_file = mrow["slab_file"] if mrow is not None else ""
+
+        # Relaxation quality. Prefer the columns step 2 / step 1 recorded (free) over
+        # re-reading a traj per slab; fall back to fmax_from_traj for pre-2026-08 data,
+        # which has neither the columns nor forces in the candidate trajs.
+        fmax_adslab = _get(best, "Fmax_adslab_eV_per_Ang")
+        if np.isnan(fmax_adslab):
+            fmax_adslab = fmax_from_traj(best["traj_path"])
+        fmax_slab = _get(mrow, "relax_fmax")
+        if np.isnan(fmax_slab):
+            fmax_slab = fmax_from_traj(slab_file)
 
         rows.append({
             "slab_name":         slab_name,
@@ -160,8 +202,15 @@ def main():
             "h_z":               float(h_pos[2]),
             "slab_file":         slab_file,
             "candidate_file":    str(best["traj_path"]),
-            "Fmax_slab_eV_per_Ang":   fmax_from_traj(slab_file),
-            "Fmax_adslab_eV_per_Ang": fmax_from_traj(best["traj_path"]),
+            # Relaxation quality — reported, NOT filtered on. The selection rule is
+            # still lowest E_ads in the sanity window, so an unconverged site can top
+            # the ranking; sort by these before trusting the top of the list.
+            "Fmax_slab_eV_per_Ang":   fmax_slab,
+            "Fmax_adslab_eV_per_Ang": fmax_adslab,
+            "slab_converged":    _flag(mrow, "relax_converged"),
+            "slab_nsteps":       _get(mrow, "relax_nsteps"),
+            "adslab_converged":  _flag(best, "adslab_converged"),
+            "adslab_nsteps":     _get(best, "adslab_nsteps"),
             # diagnostics (extra columns; ignored by downstream loaders)
             "n_candidates":      n_all,
             "n_in_window":       n_in_window,
@@ -187,17 +236,30 @@ def main():
     flag_counts = ranked["quality_flag"].value_counts().to_dict()
     print(f"\nQuality flags: {flag_counts}")
 
-    n_slab_ok   = ranked["Fmax_slab_eV_per_Ang"].notna().sum()
-    n_conv      = (ranked["Fmax_slab_eV_per_Ang"] <= FMAX_CONVERGED).sum()
-    n_adslab_ok = ranked["Fmax_adslab_eV_per_Ang"].notna().sum()
-    print(f"Fmax_slab filled: {n_slab_ok}/{len(ranked)}; converged (≤{FMAX_CONVERGED} eV/Å): "
-          f"{n_conv}/{len(ranked)}")
-    print(f"Fmax_adslab filled: {n_adslab_ok}/{len(ranked)} "
-          f"(candidate trajs lack forces — re-run 2-run_adsorbml.py to populate)")
+    # Convergence report. Nothing above filtered on it — this is what tells you how
+    # much of the ranking rests on non-stationary geometries.
+    n = len(ranked)
+    print("\nRelaxation quality (reported, NOT filtered on):")
+    for label, fmax_col, flag_col in (("slab  ", "Fmax_slab_eV_per_Ang", "slab_converged"),
+                                      ("adslab", "Fmax_adslab_eV_per_Ang", "adslab_converged")):
+        filled  = int(ranked[fmax_col].notna().sum())
+        by_fmax = int((ranked[fmax_col] <= FMAX_CONVERGED).sum())
+        flags   = ranked[flag_col]
+        yes     = int((flags == True).sum())          # noqa: E712 — None must not count
+        no      = int((flags == False).sum())         # noqa: E712
+        unknown = n - yes - no
+        print(f"  {label}: fmax recorded {filled}/{n}; ≤{FMAX_CONVERGED} eV/Å {by_fmax}/{n}  |  "
+              f"flags: converged {yes}, not converged {no}, unknown {unknown}")
+    if (ranked["adslab_converged"] == False).any():   # noqa: E712
+        worst = ranked.nlargest(3, "Fmax_adslab_eV_per_Ang")[
+            ["slab_name", "Fmax_adslab_eV_per_Ang"]]
+        print("  highest adslab fmax in the ranking:")
+        print(worst.to_string(index=False, header=False))
 
     print(f"\nTop 20 by |ΔG*H| (most-stable site, select='{args.select}'):")
     cols = ["slab_name", "gibbs_free_ml_eV", "E_ads_ml_eV", "best_rank",
-            "Fmax_slab_eV_per_Ang", "quality_flag"]
+            "Fmax_slab_eV_per_Ang", "Fmax_adslab_eV_per_Ang", "adslab_converged",
+            "quality_flag"]
     with pd.option_context("display.width", 200, "display.max_colwidth", 40):
         print(ranked.head(20)[cols].to_string(index=False))
 

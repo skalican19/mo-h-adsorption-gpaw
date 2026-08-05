@@ -5,6 +5,8 @@ Shared helpers for the AdsorbML pipeline (steps 1-3):
   - paths and env-configurable data root (ADSORBML_DATA_ROOT)
   - config constants (relaxation/screening settings, corrections)
   - logging setup, GPU detection
+  - BestFrameLBFGS: the shared optimizer for steps 1 & 2 (keeps the lowest-fmax
+    frame, records convergence) plus RELAX_INFO_KEYS / relax_outcome
   - miller-index parsing, residual-force extraction
   - sharding for concurrent SLURM-array execution
   - atomic writes (crash-safe done-marker files)
@@ -22,6 +24,7 @@ from pathlib import Path
 
 import numpy as np
 from ase.io import read, write
+from ase.optimize import LBFGS
 
 # --- Paths / env-configurable data root -------------------------------------
 REPO_ROOT   = Path(__file__).resolve().parents[2]
@@ -39,7 +42,11 @@ OUT_DIR      = OUTPUT_ROOT / "adsorbml_results"
 MIN_FREE_VRAM_GB   = 8.0
 WORKERS_PER_GPU    = 1
 FMAX               = 0.02        # eV/Å relaxation target (steps 1 & 2)
-MAX_STEPS          = 100         # optimizer step cap
+# Step caps are split: step 1 does ~320 slab relaxations, so a generous cap is cheap
+# and the slabs it produces are the input to everything downstream. Step 2 does
+# ~320 x NUM_PLACEMENTS relaxations, where the cap dominates the GPU cost.
+MAX_STEPS_SLAB      = 300        # optimizer step cap, step 1 (slab relaxation)
+MAX_STEPS_PLACEMENT = 300        # optimizer step cap, step 2 (H* placements)
 NUM_PLACEMENTS     = 100         # AdsorbML H* placements per slab (step 2)
 ADSORBATE_SMILES   = "*H"
 UMA_MODEL          = "uma-m-1p1"
@@ -111,6 +118,14 @@ def parse_millers(value) -> tuple:
 
 
 # --- Residual force ----------------------------------------------------------
+def atoms_fmax(atoms) -> float:
+    """Max residual force (eV/Å) on the *constrained* forces — what the optimizer
+    converges on. Assumes a calculator is attached; the value is cached by ASE, so
+    calling this inside an optimizer observer costs no extra model evaluation."""
+    forces = atoms.get_forces()
+    return float(np.sqrt((forces ** 2).sum(axis=1)).max())
+
+
 def fmax_from_traj(traj_path) -> float:
     """Max residual force (eV/Å) from a traj that stores forces; NaN otherwise."""
     if traj_path is None or traj_path == "" or (
@@ -125,6 +140,95 @@ def fmax_from_traj(traj_path) -> float:
         return float(np.sqrt((forces ** 2).sum(axis=1)).max())
     except Exception:
         return float("nan")
+
+
+# --- Best-frame relaxation ---------------------------------------------------
+# Keys BestFrameLBFGS stamps into atoms.info. Anything reading them must treat a
+# missing key as UNKNOWN, never as converged (pre-2026-08 trajs have none of them).
+RELAX_INFO_KEYS = (
+    "relax_converged",    # bool  — forces reached relax_fmax_target
+    "relax_nsteps",       # int   — optimizer steps actually taken
+    "relax_max_steps",    # int   — the cap that was in force
+    "relax_fmax_target",  # float — the fmax that was asked for
+    "relax_fmax",         # float — fmax of the frame that was KEPT
+    "relax_fmax_final",   # float — fmax of the LAST frame the optimizer visited
+    "relax_best_step",    # int   — which step the kept frame came from
+)
+
+
+class BestFrameLBFGS(LBFGS):
+    """LBFGS that keeps its lowest-fmax frame and records whether it converged.
+
+    Two defects of plain ASE LBFGS motivate this:
+
+    1. It has no line search, so forces/energy are not guaranteed to decrease. The
+       final frame can be far worse than the initial one — in this project's data
+       50/318 slabs ended worse than they started, the worst going from 24.6 to
+       214.2 eV/Å. Whoever consumes the result has no way to tell.
+    2. `run()` returns a convergence bool that callers routinely discard (including
+       fairchem's own `relax_job`), and the step count is never recorded, so
+       "converged" and "ran out of steps" are indistinguishable afterwards.
+
+    On exit this restores the best positions **into the live Atoms object** and
+    stamps RELAX_INFO_KEYS into `atoms.info`. Restoring in place is what makes this
+    work inside fairchem's `relax_job`, which reads energy/forces from `atoms`
+    *after* `run()` returns — those reads then describe the frame that was kept.
+    Cost is one extra force evaluation per relaxation, and only when the best frame
+    is not the last one.
+
+    The observer fires once per force evaluation including step 0, so the kept frame
+    is never worse than the input geometry.
+    """
+
+    def run(self, fmax=FMAX, steps=None):
+        if steps is None:
+            steps = MAX_STEPS_PLACEMENT
+        atoms = self.atoms
+        best = {"fmax": float("inf"), "step": -1, "positions": None}
+
+        def _track_best():
+            current = atoms_fmax(atoms)
+            # NaN never wins this comparison, so exploded frames cannot be selected.
+            if current < best["fmax"]:
+                best.update(fmax=current, step=self.nsteps,
+                            positions=atoms.get_positions())
+
+        self.attach(_track_best, interval=1)
+        converged = bool(super().run(fmax=fmax, steps=steps))
+        final_fmax = atoms_fmax(atoms)
+
+        # `not (best >= final)` rather than `best < final`, so a NaN final frame (forces
+        # blew up) also loses to the best frame instead of silently winning.
+        if best["positions"] is not None and not (best["fmax"] >= final_fmax):
+            atoms.set_positions(best["positions"])
+            kept_fmax, kept_step = best["fmax"], best["step"]
+        else:
+            kept_fmax, kept_step = final_fmax, self.nsteps
+
+        atoms.info.update({
+            "relax_converged":   converged,
+            "relax_nsteps":      self.nsteps,
+            "relax_max_steps":   steps,
+            "relax_fmax_target": fmax,
+            "relax_fmax":        kept_fmax,
+            "relax_fmax_final":  final_fmax,
+            "relax_best_step":   kept_step,
+        })
+        return converged
+
+
+def relax_outcome(info) -> str:
+    """Human-readable outcome from a RELAX_INFO_KEYS mapping (atoms.info or a CSV row)."""
+    converged = info.get("relax_converged")
+    nsteps    = info.get("relax_nsteps")
+    cap       = info.get("relax_max_steps")
+    if converged is None:
+        return "UNKNOWN (no convergence flags recorded)"
+    if converged:
+        return "converged"
+    if nsteps is not None and cap is not None and nsteps >= cap:
+        return f"NOT CONVERGED (hit {cap}-step cap)"
+    return f"NOT CONVERGED (optimizer stopped early at step {nsteps})"
 
 
 # --- Sharding (concurrent SLURM-array safety) --------------------------------

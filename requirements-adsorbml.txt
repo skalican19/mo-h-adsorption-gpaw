@@ -1,5 +1,15 @@
 ase>=3.27.0
 numpy>=1.23.0
 pandas>=1.5.0
+# NOTE: fairchem-core's [adsorbml] extra (dscribe / scikit-image / x3dase) is
+# deliberately NOT requested — dscribe is a C++ extension with no aarch64/cp312
+# wheel, so it source-builds and fails on Perun's GH200 nodes. Verified (grep of
+# fairchem-core 2.21 + fairchem-data-oc 1.0.2 source) that none of the three are
+# imported by the run_adsorbml path we use, so the extra is pure liability here.
 fairchem-core>=1.1.0
 fairchem-data-oc>=1.0.2
+# fairchem.core.components.calculate.__init__ imports pyarrow unconditionally
+# (via simulation_tools.trajectory), but fairchem-core only declares it under
+# its optional `extras` group — so a bare install ModuleNotFoundErrors on
+# `import run_adsorbml`. Pin it explicitly here. (ray's floor is >=17.)
+pyarrow>=17.0.0

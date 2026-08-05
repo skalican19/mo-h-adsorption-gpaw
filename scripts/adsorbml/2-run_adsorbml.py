@@ -5,9 +5,14 @@ AdsorbML step 2 (map: screen): Screen H* adsorption candidates on UMA-M relaxed
 slabs using AdsorbML (NUM_PLACEMENTS placements per slab, ML-relaxed with the
 UMA-M OC20 head).
 
+Relaxations use BestFrameLBFGS (see _common.py), so each candidate keeps its
+lowest-fmax frame and reports whether it converged; plain LBFGS keeps the last frame,
+which is not necessarily the best one.
+
 Reads:  <data>/adsorbml_manifest.csv
-Writes: <data>/adsorbml_results/<name>/candidates.csv
-        <data>/adsorbml_results/<name>/candidate_*.traj
+Writes: <data>/adsorbml_results/<name>/candidates.csv   (+ Fmax/converged/nsteps cols)
+        <data>/adsorbml_results/<name>/candidate_*.traj (now carry energy + forces)
+        <data>/adsorbml_results/<name>/anomalies.csv    (why placements were rejected)
         <data>/adsorbml_results/<name>/adsorbml.log
         <data>/adsorbml_results/batch_summary.csv   (reduce; single run only)
 
@@ -15,6 +20,7 @@ Writes: <data>/adsorbml_results/<name>/candidates.csv
 
 Usage (local — one command; batch summary written automatically):
   python scripts/adsorbml/2-run_adsorbml.py
+  python scripts/adsorbml/2-run_adsorbml.py --overwrite   # re-screen slabs already done
 
 Usage (HPC SLURM array — shard the screening, then summarise ONCE):
   python scripts/adsorbml/2-run_adsorbml.py --shard $SLURM_ARRAY_TASK_ID/8
@@ -28,17 +34,25 @@ import traceback
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import ase.io
 from ase.calculators.singlepoint import SinglePointCalculator
-from ase.optimize import LBFGS
 from ase.constraints import FixAtoms
-from fairchem.data.oc.core import Slab
-from fairchem.core.components.calculate.recipes.adsorbml import run_adsorbml
+
+# fairchem (and therefore torch) is imported lazily inside process_row(), not here.
+# run_gpu_workers() spawns workers with multiprocessing's 'spawn' context, which
+# re-imports this module in every child process before _worker_loop() (_common.py)
+# sets CUDA_VISIBLE_DEVICES. A module-level fairchem import would touch/initialize
+# CUDA during that re-import, before the per-worker GPU pin is applied, so every
+# worker's pin would silently no-op and they'd all default to cuda:0 -- the same
+# physical GPU regardless of how many were allocated. See 1-relax_uma_omat.py /
+# _common.py's own lazy fairchem import for the same reason.
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import (
-    MANIFEST_CSV, OUT_DIR, ADSORBATE_SMILES, FMAX, MAX_STEPS, NUM_PLACEMENTS,
+    MANIFEST_CSV, OUT_DIR, ADSORBATE_SMILES, FMAX, MAX_STEPS_PLACEMENT,
+    NUM_PLACEMENTS, BestFrameLBFGS,
     setup_logging, parse_millers, get_shard, apply_shard,
     write_atomic_csv, run_gpu_workers,
 )
@@ -46,7 +60,14 @@ from _common import (
 _CANDIDATES_COLS = [
     "candidate_rank", "E_adslab_ml_eV", "E_slab_ml_eV",
     "E_gas_ref_ml_eV", "E_ads_ml_eV", "anomalies", "traj_path",
+    # Relaxation quality of this candidate (from BestFrameLBFGS via atoms.info).
+    # 'anomalies' above is kept for schema compatibility but is always empty:
+    # run_adsorbml only returns anomaly-FREE candidates. The rejected placements
+    # are recorded separately in anomalies.csv.
+    "Fmax_adslab_eV_per_Ang", "adslab_converged", "adslab_nsteps", "adslab_best_step",
 ]
+
+_ANOMALIES_COLS = ["placement_index", "anomalies"]
 
 master_log = logging.getLogger("adsorbml.master")
 # Per-slab file/console logging uses its own formatters (kept local to step 2).
@@ -68,7 +89,12 @@ def _close_log(log: logging.Logger) -> None:
         log.removeHandler(h)
 
 
-def process_row(row: dict, calc) -> None:
+def process_row(item, calc) -> None:
+    """Worker adapter: unpack a (manifest_row, overwrite) queue item."""
+    from fairchem.data.oc.core import Slab
+    from fairchem.core.components.calculate.recipes.adsorbml import run_adsorbml
+
+    row, overwrite = item
     slab_file = row["slab_file"]
     slab_name = row["slab_name"]
     millers   = parse_millers(row["millers"])
@@ -88,10 +114,24 @@ def process_row(row: dict, calc) -> None:
         ch.setFormatter(_COMPOUND_LOG_FMT)
         comp_log.addHandler(ch)
 
-    if done_csv.exists():
+    if done_csv.exists() and not overwrite:
         comp_log.info(f"SKIP (already done): {slab_name}")
         _close_log(comp_log)
         return
+    if done_csv.exists():
+        # Clear the previous run's outputs. candidates.csv goes FIRST because it is the
+        # done-marker _is_done() keys on: if this run is then killed (walltime, crash),
+        # the slab reads as not-done and gets redone, rather than being marked complete
+        # while its candidate_*.traj files are already gone. The traj sweep is needed
+        # because a shorter candidate list this time would otherwise leave orphaned
+        # candidate_<k>.traj files that candidates.csv no longer references.
+        done_csv.unlink()
+        stale = sorted(run_dir.glob("candidate_*.traj")) + [run_dir / "anomalies.csv"]
+        for p in stale:
+            if p.exists():
+                p.unlink()
+        comp_log.info(f"OVERWRITE: recomputing {slab_name} "
+                      f"(removed candidates.csv + {len(stale)} previous output file(s))")
 
     comp_log.info("=" * 50)
     comp_log.info(f"Running: {slab_name}")
@@ -112,9 +152,14 @@ def process_row(row: dict, calc) -> None:
             slab=slab,
             adsorbate=ADSORBATE_SMILES,
             calculator=calc,
-            optimizer_cls=LBFGS,
+            # BestFrameLBFGS instead of plain LBFGS: fairchem's relax_job discards the
+            # convergence bool and keeps the LAST frame, which (no line search) can be
+            # worse than the input. BestFrameLBFGS restores the lowest-fmax frame into
+            # the live atoms before relax_job reads energy/forces off it, and records
+            # the flags in atoms.info.
+            optimizer_cls=BestFrameLBFGS,
             fmax=FMAX,
-            steps=MAX_STEPS,
+            steps=MAX_STEPS_PLACEMENT,
             num_placements=NUM_PLACEMENTS,
             reference_ml_energies=True,
         )
@@ -123,7 +168,24 @@ def process_row(row: dict, calc) -> None:
         _close_log(comp_log)
         return
 
+    # Record which placements were REJECTED and why. outputs["adslab_anomalies"] covers
+    # all NUM_PLACEMENTS placements in generation order, while outputs["adslabs"] holds
+    # only the survivors — so this is the only place the rejection reasons exist.
+    all_anomalies = outputs.get("adslab_anomalies") or []
+    write_atomic_csv(
+        pd.DataFrame(
+            [{"placement_index": i, "anomalies": "|".join(a)} for i, a in enumerate(all_anomalies)],
+            columns=_ANOMALIES_COLS,
+        ),
+        run_dir / "anomalies.csv",
+    )
+
     candidates = outputs["adslabs"]
+    n_rejected = sum(1 for a in all_anomalies if a)
+    comp_log.info(
+        f"Placements: {len(all_anomalies)} relaxed, {n_rejected} rejected by anomaly "
+        f"detection, {len(candidates)} kept"
+    )
     if not candidates:
         comp_log.warning(f"No valid placements for {slab_name}")
         write_atomic_csv(pd.DataFrame(columns=_CANDIDATES_COLS), done_csv)
@@ -134,18 +196,23 @@ def process_row(row: dict, calc) -> None:
     for i, cand in enumerate(candidates):
         traj_path = str(run_dir / f"candidate_{i}.traj")
         atoms = cand["atoms"]
-        try:
-            spc = SinglePointCalculator(
-                atoms,
-                energy=atoms.get_potential_energy(),
-                forces=atoms.get_forces(),
-            )
-            atoms.calc = spc
-        except Exception:
-            pass
+        res   = cand["results"]
+
+        # fairchem's relax_job sets atoms.calc = None before returning, so the energy
+        # and forces must come from res — reading them off atoms raises. (That is why
+        # every candidate traj written before 2026-08 has no forces and no fmax.)
+        energy, forces = res.get("energy"), res.get("forces")
+        if energy is None or forces is None:
+            comp_log.warning(f"candidate {i}: missing energy/forces in results; "
+                             f"traj written without a calculator")
+            fmax = float("nan")
+        else:
+            atoms.calc = SinglePointCalculator(atoms, energy=energy, forces=forces)
+            fmax = float(np.sqrt((np.asarray(forces) ** 2).sum(axis=1)).max())
+
         ase.io.write(traj_path, atoms)
-        res = cand["results"]
-        ref = res.get("referenced_adsorption_energy", {})
+        ref  = res.get("referenced_adsorption_energy", {})
+        info = atoms.info
         rows.append({
             "candidate_rank":  i,
             "E_adslab_ml_eV":  res.get("energy", float("nan")),
@@ -154,11 +221,22 @@ def process_row(row: dict, calc) -> None:
             "E_ads_ml_eV":     ref.get("adsorption_energy", float("nan")),
             "anomalies":       "|".join(res.get("adslab_anomalies", [])),
             "traj_path":       traj_path,
+            "Fmax_adslab_eV_per_Ang": fmax,
+            "adslab_converged":       info.get("relax_converged"),
+            "adslab_nsteps":          info.get("relax_nsteps"),
+            "adslab_best_step":       info.get("relax_best_step"),
         })
 
-    write_atomic_csv(pd.DataFrame(rows), done_csv)
+    write_atomic_csv(pd.DataFrame(rows, columns=_CANDIDATES_COLS), done_csv)
+
     best_e = min(r["E_ads_ml_eV"] for r in rows)
+    n_conv = sum(1 for r in rows if r["adslab_converged"] is True)
+    fmaxes = [r["Fmax_adslab_eV_per_Ang"] for r in rows
+              if not pd.isna(r["Fmax_adslab_eV_per_Ang"])]
+    median_fmax = f"{np.median(fmaxes):.4f} eV/Å" if fmaxes else "n/a"
     comp_log.info(f"Best E_ads (ML) = {best_e:.4f} eV  ({len(candidates)} candidates)")
+    comp_log.info(f"Converged candidates (fmax <= {FMAX} eV/Å): {n_conv}/{len(rows)}  |  "
+                  f"median fmax {median_fmax}")
     _close_log(comp_log)
 
 
@@ -196,6 +274,11 @@ def main():
                              "(default: from SLURM_ARRAY_TASK_ID, else the whole set).")
     parser.add_argument("--summary-only", action="store_true",
                         help="Skip screening; just (re)build batch_summary.csv from existing candidates.")
+    parser.add_argument("--overwrite", action="store_true",
+                        help="Re-screen even if <slab>/candidates.csv already exists, replacing "
+                             "that slab's candidate_*.traj and anomalies.csv. Without this, "
+                             "screened slabs are skipped, so a methodology change has no effect "
+                             "on slabs already done.")
     args = parser.parse_args()
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -209,15 +292,17 @@ def main():
 
     df       = pd.read_csv(MANIFEST_CSV)
     all_rows = sorted(df.to_dict("records"), key=lambda r: r["slab_name"])
-    pending  = [r for r in all_rows if not _is_done(r["slab_name"])]
+    pending  = [r for r in all_rows if args.overwrite or not _is_done(r["slab_name"])]
     shard    = get_shard(args.shard)
     pending  = apply_shard(pending, shard)
     master_log.info(
         f"Total: {len(all_rows)}  |  shard {shard[0]}/{shard[1]}  |  "
         f"Pending in this shard: {len(pending)}"
+        f"{'  |  OVERWRITE: existing results will be replaced' if args.overwrite else ''}"
     )
 
-    run_gpu_workers(pending, task_name="oc20", process_item=process_row, n_workers=args.workers)
+    run_gpu_workers([(r, args.overwrite) for r in pending],
+                    task_name="oc20", process_item=process_row, n_workers=args.workers)
 
     if shard[1] == 1:
         _write_batch_summary()

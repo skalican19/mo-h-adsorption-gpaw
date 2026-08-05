@@ -58,8 +58,21 @@ requirements-adsorbml.txt     # ase, numpy, pandas, fairchem-core, fairchem-data
 - `RELAXATION_CONFIG`: fmax 0.03 eV/Å, 200 steps (overridable via `--fmax`/`--relax-steps`;
   `--kpts` overrides the mesh). CLI overrides default to None → inherit these config values.
 - `ENTROPY_CORRECTION = 0.24 eV`; `CORES_PER_CALC = 11`; `RAM_PER_CALC_GB = 4`.
-- AdsorbML step constants live in `scripts/adsorbml/_common.py` (FMAX 0.02, MAX_STEPS 100,
-  NUM_PLACEMENTS 100, UMA_MODEL "uma-m-1p1", same 0.24 correction).
+- AdsorbML step constants live in `scripts/adsorbml/_common.py` (FMAX 0.02,
+  MAX_STEPS_SLAB 300 for step 1 / MAX_STEPS_PLACEMENT 100 for step 2, NUM_PLACEMENTS 100,
+  UMA_MODEL "uma-m-1p1", same 0.24 correction).
+- Both AdsorbML steps relax with **`BestFrameLBFGS`** (`_common.py`), not plain LBFGS:
+  ASE's LBFGS has no line search, so the last frame can be worse than the input (in the
+  pre-2026-08 data, 50/318 slabs ended worse than they started, one at 214 eV/Å). It keeps
+  the lowest-fmax frame and stamps `relax_converged`/`relax_nsteps`/`relax_fmax`/… into
+  `atoms.info`, which flow into the manifest, `candidates.csv`, and the ranked CSV.
+  **Step 3 reports convergence but does not filter on it** — the selection rule is still
+  lowest `E_ads` in the sanity window, so check `Fmax_adslab_eV_per_Ang` /
+  `adslab_converged` before trusting the top of a ranking. Results written before
+  2026-08 have no flags and must read as *unknown*, never as converged.
+- Step 2 also writes `<slab>/anomalies.csv` — why each of the 100 placements was rejected.
+  The `anomalies` column in `candidates.csv` is always empty by construction
+  (`run_adsorbml` returns only anomaly-free candidates).
 
 ## Running
 
