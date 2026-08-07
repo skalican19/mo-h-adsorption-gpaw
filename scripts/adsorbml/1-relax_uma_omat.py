@@ -38,7 +38,6 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from ase.io import read
-from ase.constraints import FixAtoms
 from ase.calculators.singlepoint import SinglePointCalculator
 
 # scripts/ on the path makes "adsorbml" resolve as a namespace package, so
@@ -51,6 +50,7 @@ from adsorbml._common import (
     setup_logging, millers_from_name, get_shard, apply_shard,
     write_atomic_csv, write_atomic_traj, run_gpu_workers,
 )
+from adsorbml.tagging import tag_and_constrain, frozen_but_reachable
 
 # Structures excluded from AdsorbML (not 2D-periodic surface slabs or off-topic)
 _EXCLUDE = ("graphene", "nanoribbon", "edge")
@@ -69,14 +69,6 @@ def _tile_slab(atoms):
     return atoms.repeat([na, nb, 1]) if (na > 1 or nb > 1) else atoms
 
 
-def _tag_atoms(atoms):
-    """Assign OC20 surface tags: 1=surface layer, 0=subsurface/bulk. tag=2 is reserved for adsorbates."""
-    z_max = atoms.positions[:, 2].max()
-    tags = [1 if atom.position[2] > z_max - 2.0 else 0 for atom in atoms]
-    atoms.set_tags(tags)
-    return atoms
-
-
 def _relax_one(name: str, poscar_path: Path, calc, overwrite: bool = False) -> None:
     log = logging.getLogger(f"relax.{name}")
     out_traj = UMA_RELAXED / f"{name}.traj"
@@ -91,8 +83,10 @@ def _relax_one(name: str, poscar_path: Path, calc, overwrite: bool = False) -> N
     try:
         atoms = read(str(poscar_path))
         atoms = _tile_slab(atoms)
-        atoms = _tag_atoms(atoms)
-        atoms.set_constraint(FixAtoms(mask=[t == 0 for t in atoms.get_tags()]))
+        # Tags decide which atoms relax, where H is later placed, AND what the anomaly
+        # filter calls "intercalated" — see adsorbml/tagging.py for why the old
+        # fixed-2 Å rule silently zeroed out every Mo2N structure.
+        atoms = tag_and_constrain(atoms, log=log)
         atoms.calc = calc
 
         # BestFrameLBFGS keeps the lowest-fmax frame (plain LBFGS can end worse than
@@ -107,6 +101,18 @@ def _relax_one(name: str, poscar_path: Path, calc, overwrite: bool = False) -> N
             snapshot, energy=energy, forces=atoms.get_forces()
         )
         write_atomic_traj(snapshot, out_traj)
+
+        # Tags were assigned to the unrelaxed geometry. If the surface reconstructed
+        # enough to expose an atom that was legitimately buried when it was frozen, H
+        # placements over it will be rejected as intercalated in step 2 — warn now
+        # rather than let step 2 return a mysteriously short candidate list.
+        late = frozen_but_reachable(atoms)
+        if late:
+            log.warning(
+                f"{name}: relaxation exposed {len(late)} frozen atom(s) "
+                f"(indices {late[:8]}). Step 2 may reject placements over them as "
+                f"adsorbate_intercalated."
+            )
 
         info = atoms.info
         log.info(

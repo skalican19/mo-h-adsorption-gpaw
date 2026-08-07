@@ -31,6 +31,8 @@ scripts/
   generate_structures.py     # build all POSCARs under data/inputs/VASP_inputs/<name>/
   gpaw_h_adsorption.py        # PRIMARY calculator; 3 modes (see CLI flags below)
   adsorbml/                   # ML screening pipeline (steps 1-3) + its own _common.py (adsorbml-specific helpers)
+    tagging.py                #   surface tags (1=free, 0=frozen) — see "Surface tagging" below
+    audit_tags.py             #   CPU-only tag audit over all inputs; gate before spending GPU time
   hpc_scripts/adsorbml/       # Perun GPU launchers for the AdsorbML pipeline
                               #   (setup_perun_uma_env.sh, submit_perun_adsorbml.sh, perun_adsorbml_worker.sh)
   compute_h_adsorption.py     # LEGACY: Materials Project + VASP input templating
@@ -72,7 +74,45 @@ requirements-adsorbml.txt     # ase, numpy, pandas, fairchem-core, fairchem-data
   2026-08 have no flags and must read as *unknown*, never as converged.
 - Step 2 also writes `<slab>/anomalies.csv` — why each of the 100 placements was rejected.
   The `anomalies` column in `candidates.csv` is always empty by construction
-  (`run_adsorbml` returns only anomaly-free candidates).
+  (`run_adsorbml` returns only anomaly-free candidates). A slab that ends with **zero**
+  candidates now logs an ERROR with the anomaly tally (both per-slab and in the batch
+  reduce) instead of quietly writing an empty CSV.
+
+## Surface tagging (`scripts/adsorbml/tagging.py`)
+
+Tags are assigned once, in step 1, and drive **three** things in fairchem:
+which atoms relax (`FixAtoms(mask=tag==0)`), **where H is placed** (Delaunay mesh over
+tag-1 atoms only), and **what `is_adsorbate_intercalated` rejects** (any placement whose
+H neighbours a tag-0 atom).
+
+Because of the third, a frozen atom that H can physically touch turns every placement
+over it into a false rejection. The old `z > z_max - 2.0` rule did exactly that and
+silently produced **zero candidates for all 48 Mo₂N structures** (γ-Mo₂N(001) has 2.00 Å
+spacing and ordered N-vacancy pits whose floor is a second-layer Mo). 219/350 inputs were
+affected; the `Ni_*_cluster*` interfaces worst, freeing as few as 5 atoms of 262.
+
+`surface_tags()` tags 1 if ANY of: OC20 height window (Cartesian z, inclusive);
+under-coordination above the COM (uses the slab's own interior when no bulk is given);
+**an H-sized probe reaches the atom from +z**; or the atom is in the top 2 atomic layers
+(z-clustering, so the freed fraction is independent of interlayer spacing). Stacks of ≤3
+layers are freed entirely. It **raises** if any reachable atom would stay frozen.
+
+Note upstream's `fairchem...slab.tag_surface_atoms` does *not* fix this — verified, it
+frees the same 12/192 on Mo₂N(001). Reachability is one-sided (+z) on purpose: AdsorbML
+never places the adsorbate below the slab, so the bottom face stays frozen as the bulk
+proxy.
+
+```
+python scripts/adsorbml/audit_tags.py [--include "Mo2N_*"] [--compare]   # CPU, no GPU
+```
+Exit status 1 if any structure fails the invariant, so it can gate a submission script.
+Currently **0/350 fail**. Run it after any change to the generator or the tag rule.
+
+Caveats: the probe is one-sided, so it cannot see undercuts, side-exposed faces (edge
+ribbons — excluded from the pipeline anyway), or H migrating sideways during relaxation.
+Results produced before this rule landed used a fixed 2 Å window and are not directly
+comparable; Mo₂C(110) tags changed, so the pre-existing Mo₂C results need re-running
+before they can be merged with new ones.
 
 ## Running
 

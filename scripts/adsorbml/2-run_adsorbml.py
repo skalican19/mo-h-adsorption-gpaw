@@ -31,6 +31,7 @@ import glob
 import logging
 import sys
 import traceback
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
@@ -38,7 +39,6 @@ import numpy as np
 import pandas as pd
 import ase.io
 from ase.calculators.singlepoint import SinglePointCalculator
-from ase.constraints import FixAtoms
 
 # fairchem (and therefore torch) is imported lazily inside process_row(), not here.
 # run_gpu_workers() spawns workers with multiprocessing's 'spawn' context, which
@@ -56,6 +56,7 @@ from _common import (
     setup_logging, parse_millers, get_shard, apply_shard,
     write_atomic_csv, run_gpu_workers,
 )
+from tagging import tag_and_constrain
 
 _CANDIDATES_COLS = [
     "candidate_rank", "E_adslab_ml_eV", "E_slab_ml_eV",
@@ -138,8 +139,16 @@ def process_row(item, calc) -> None:
 
     try:
         atoms = ase.io.read(slab_file)
-        if not atoms.constraints:
-            atoms.set_constraint(FixAtoms(mask=[t == 0 for t in atoms.get_tags()]))
+        # Re-tag on the RELAXED geometry. Step 1 tagged the unrelaxed slab, and a surface
+        # that reconstructs during relaxation can expose an atom that was legitimately
+        # buried when it was frozen — every H placement near it would then be rejected as
+        # intercalated. This is the last point before placements are generated, so it is
+        # the right place to correct for that. No model calls, so it is nearly free.
+        before = list(atoms.get_tags())
+        atoms = tag_and_constrain(atoms, log=comp_log)
+        moved = sum(1 for a, b in zip(before, atoms.get_tags()) if a != b)
+        if moved:
+            comp_log.info(f"Re-tagged relaxed slab: {moved} atom(s) changed tag since step 1")
         slab  = Slab(bulk=None, slab_atoms=atoms, millers=millers,
                      shift=None, top=None, oriented_bulk=None)
     except Exception as exc:
@@ -187,7 +196,18 @@ def process_row(item, calc) -> None:
         f"detection, {len(candidates)} kept"
     )
     if not candidates:
-        comp_log.warning(f"No valid placements for {slab_name}")
+        # Every placement rejected is a result you must never read past. Before the
+        # tagging fix this printed one WARNING line and an empty CSV, and all 48 Mo2N
+        # structures scrolled by unnoticed. Name the reason so the failure mode is
+        # obvious: an all-`adsorbate_intercalated` tally means the tags are wrong (a
+        # frozen atom H can reach), not that the surface is inert.
+        tally = Counter(a for anomaly in all_anomalies for a in anomaly)
+        breakdown = ", ".join(f"{k}={v}" for k, v in tally.most_common()) or "none recorded"
+        comp_log.error(
+            f"ZERO CANDIDATES for {slab_name}: all {len(all_anomalies)} placements "
+            f"rejected ({breakdown}). If this is dominated by adsorbate_intercalated, "
+            f"suspect the surface tags, not the chemistry — see adsorbml/tagging.py."
+        )
         write_atomic_csv(pd.DataFrame(columns=_CANDIDATES_COLS), done_csv)
         _close_log(comp_log)
         return
@@ -243,15 +263,27 @@ def process_row(item, calc) -> None:
 def _write_batch_summary() -> None:
     """Reduce: consolidate all per-slab candidates.csv into one batch summary."""
     all_csvs = sorted(glob.glob(str(OUT_DIR / "*" / "candidates.csv")))
-    frames = []
+    frames, empty = [], []
     for csv_path in all_csvs:
         try:
             part = pd.read_csv(csv_path)
             if len(part) > 0:
                 part.insert(0, "slab_name", Path(csv_path).parent.name)
                 frames.append(part)
+            else:
+                empty.append(Path(csv_path).parent.name)
         except Exception as exc:
             master_log.warning(f"Skipping {csv_path}: {exc}")
+
+    # A slab that finished with zero candidates is a completed job with no result. It
+    # must be visible in the reduce, or the campaign silently shrinks (48 Mo2N slabs
+    # vanished this way) and step 3 just ranks whatever is left.
+    if empty:
+        master_log.error(
+            f"{len(empty)} slab(s) finished with ZERO candidates — every placement was "
+            f"rejected. These contribute nothing to the ranking:\n  "
+            + "\n  ".join(empty)
+        )
 
     if frames:
         summary = pd.concat(frames, ignore_index=True)
