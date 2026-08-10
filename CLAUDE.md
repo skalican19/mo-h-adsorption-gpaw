@@ -241,11 +241,41 @@ Known limits of the current sizing:
   doped surface more than an isolated dopant. Raise to 10.0 if that matters. This does
   *not* fix the separate finding that the best H site lands 5.5–8.6 Å from the dopant;
   that needs site generation restricted to a radius around the defect, in step 2.
-- **7 Å is an OC20 (metals/alloys) convention.** Mo₂N/Mo₂C/MoB/MoP are compounds; OC22
-  (the compound dataset) uses ≥8 Å, 12 Å vacuum, symmetric slabs, all atoms free. A
-  thickness-convergence check on Mo₂N(001) (7 / 10 / 14 Å) is outstanding.
+- **7 Å is an OC20 (metals/alloys) convention** and Mo₂N/Mo₂C/MoB/MoP are compounds (OC22,
+  the compound dataset, uses ≥8 Å, 12 Å vacuum, symmetric slabs, all atoms free). **Checked
+  on Mo₂N(001) 2026-08-10 and it holds** — see "Thickness convergence" below. Not re-checked
+  for Mo₂C / MoB / MoP.
 - **MoB(111)** has no clean atomic layering (a z-clustering probe collapses its 8.8 Å into
   one "plane"), so "surface layer" is ill-defined there. Predates this change.
+
+### Thickness convergence (Mo₂N(001), UMA, 2026-08-10)
+
+`MIN_SLAB_THICKNESS = 7.0` is justified, not assumed. SlabGenerator quantises to whole
+oriented-cell repeats, so Mo₂N(001) only offers 8 / 16 / 24 / 32 Å — a "7 / 10 / 14 Å"
+ladder does not exist, 10 and 14 both land on 16 Å. All four run through AdsorbML steps 1–3,
+100/100 candidates kept each, all converged:
+
+| material thickness | planes | atoms | ΔG_H (eV) | Δ vs next | step-2 wall time |
+|---|---|---|---|---|---|
+| **8 Å** (the default) | 4 | 48 | **−0.0535** | 5.1 meV | 12 min |
+| 16 Å | 8 | 96 | −0.0587 | 2.6 meV | 27 min |
+| 24 Å | 12 | 144 | −0.0613 | 1.0 meV | 38 min |
+| 32 Å (the old slab) | 16 | 192 | −0.0623 | — | 53 min |
+
+Monotonic, each doubling roughly halving the residual → extrapolated limit ≈ −0.063 eV.
+**8 Å errs by 9 meV against 32 Å at 4.6× less compute.** The binding site is *identical* at
+every thickness (H +0.13…+0.17 Å above the topmost atom, 5-fold Mo at 2.07–2.42 Å, no N
+neighbour — the ordered N-vacancy hollow), so only the depth of frozen bulk varies. Surface
+tagging also frees exactly 24 atoms / 2 layers in all four, which is what makes it a clean test.
+
+Useful side result: the 32 Å slab reproduces ΔG_H = **−0.062 eV**, matching the pre-resize
+campaign value for Mo₂N(001) — the resize did not change the answer for the same geometry.
+
+Caveats: UMA only, no DFT; pristine Mo₂N(001) only (a defect or dopant could couple to the
+slab depth differently); and 8 Å is thin enough that the *bulk* interior is not yet
+converged — the per-repeat slab energy increment is off by 0.41 eV at one repeat and settles
+at −493.2098 eV from the third. That cancels in ΔG (an `E_slab` difference), which is why the
+adsorption energy converges much faster than the total energy.
 
 ## Running
 
