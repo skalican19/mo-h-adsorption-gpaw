@@ -11,6 +11,12 @@ nohup.out
 /data/adsorbml_results/
 /data/uma_relaxed/
 
+# Snapshots pulled back off the cluster. Heavy, and superseded by every rerun --
+# they were only in .git/info/exclude, so a fresh clone had nothing stopping a
+# `git add -A` from committing them.
+/partial_results/
+/perun_logs/
+
 # Docs (keep locally, ignore in git)
 /docs/
 

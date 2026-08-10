@@ -222,6 +222,41 @@ def tag_and_constrain(atoms, log=None):
     return atoms
 
 
+def retag_relaxed(atoms, log=None):
+    """Re-tag a RELAXED slab, but only ever free more atoms — never re-freeze.
+
+    Tags are assigned to the unrelaxed geometry, and relaxation can expose an atom that
+    was legitimately buried at the time. Re-tagging catches that. But recomputing from
+    scratch on a relaxed surface also *loses* atoms, because both the height window and
+    the layer clustering degrade once a surface rumples: on Mo2N(001) the flat 12-atom
+    top layer relaxes into an 8+4 split and lifts z_max, so "top 2 layers" collapses onto
+    what used to be one layer and the 2 Å window halves. Recomputing alone took that slab
+    from 24 free atoms to 16.
+
+    Re-freezing would also be wrong on its own terms: the slab was relaxed with those
+    atoms free, so its geometry and reference energy already assume they move. Taking the
+    union keeps that consistent and still adds anything newly exposed.
+    """
+    from ase.constraints import FixAtoms
+
+    before = np.asarray(atoms.get_tags())
+    # log=None: surface_tags' own count is the pre-union figure and reads as the answer
+    # when it is not. The line below reports the number that actually takes effect.
+    fresh = surface_tags(atoms)
+    merged = np.maximum(before, fresh)
+
+    added = int(((merged == 1) & (before == 0)).sum())
+    kept = int(((fresh == 0) & (before == 1)).sum())
+    if log:
+        log.info(f"  re-tag: {int(merged.sum())}/{len(atoms)} atoms free "
+                 f"(+{added} newly exposed by relaxation, {kept} kept free that a fresh "
+                 f"tagging would have re-frozen through rumpling)")
+
+    atoms.set_tags(merged.tolist())
+    atoms.set_constraint(FixAtoms(mask=[t == 0 for t in merged]))
+    return atoms
+
+
 def frozen_but_reachable(atoms) -> list:
     """Indices of tag-0 atoms a hydrogen probe can reach — should always be empty.
 

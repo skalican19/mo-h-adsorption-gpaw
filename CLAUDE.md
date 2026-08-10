@@ -86,10 +86,18 @@ tag-1 atoms only), and **what `is_adsorbate_intercalated` rejects** (any placeme
 H neighbours a tag-0 atom).
 
 Because of the third, a frozen atom that H can physically touch turns every placement
-over it into a false rejection. The old `z > z_max - 2.0` rule did exactly that and
-silently produced **zero candidates for all 48 Mo₂N structures** (γ-Mo₂N(001) has 2.00 Å
-spacing and ordered N-vacancy pits whose floor is a second-layer Mo). 219/350 inputs were
-affected; the `Ni_*_cluster*` interfaces worst, freeing as few as 5 atoms of 262.
+over it into a false rejection. The old `z > z_max - 2.0` rule did exactly that on
+**219/350 inputs**; the `Ni_*_cluster*` interfaces worst, freeing as few as 5 atoms of 262
+(the cluster apex sets `z_max`, so a 2 Å window leaves the whole substrate rigid). That is
+a real defect — surfaces that cannot relax — and it is fixed.
+
+**It is not what caused the zero-candidate failure.** All 48 Mo₂N structures returning
+0/100 was the placement-wrap bug (next section); tagging and the wrap bug were found in
+the same investigation and are easy to conflate. The evidence they are separate: the
+frozen-but-reachable count is *anti*-correlated with rejections (Mo₂C(100) had **0** such
+atoms and 21 % rejections; Mo₂C(111) had **18** and 0.8 %), and Mo₂N goes 0 → 100
+candidates with the **old** tags once the cell is padded. Impact of the tagging fix alone
+on ΔG_H is small but nonzero: Mo₂C(110) shifted +0.011 eV, Mo₂C(100) unchanged to 3 d.p.
 
 `surface_tags()` tags 1 if ANY of: OC20 height window (Cartesian z, inclusive);
 under-coordination above the COM (uses the slab's own interior when no bulk is given);
@@ -105,14 +113,139 @@ proxy.
 ```
 python scripts/adsorbml/audit_tags.py [--include "Mo2N_*"] [--compare]   # CPU, no GPU
 ```
-Exit status 1 if any structure fails the invariant, so it can gate a submission script.
-Currently **0/350 fail**. Run it after any change to the generator or the tag rule.
+Exit status 1 if any structure fails an invariant, so it can gate a submission script. It
+checks reachability *and* the wrap margin (next section). Currently **0/342 fail**
+(free fraction min 8.6 %, median 17.8 %; wrap margin min +2.0 Å, median +4.4 Å). Run it
+after any change to the generator or the tag rule.
 
 Caveats: the probe is one-sided, so it cannot see undercuts, side-exposed faces (edge
 ribbons — excluded from the pipeline anyway), or H migrating sideways during relaxation.
 Results produced before this rule landed used a fixed 2 Å window and are not directly
 comparable; Mo₂C(110) tags changed, so the pre-existing Mo₂C results need re-running
 before they can be merged with new ones.
+
+## Placement wrap bug — why cells must be tall (fairchem, upstream)
+
+`_get_scaled_normal` (`fairchem/data/oc/core/adsorbate_slab_config.py`) centres the
+adsorption site at the cell centre and calls `wrap()`, commenting that this means it
+"[doesn't] need to deal with pbc issues". With `pbc z = True` that is false:
+
+1. Centring a top-surface site pushes the slab's underside below z=0, and `wrap()` brings
+   it back in **above** the site.
+2. The overlap solver lifts the adsorbate to clear those phantom atoms — ~20 Å for Mo₂N,
+   past the top of the cell (H at z≈59 in a 46 Å cell).
+3. `ocp_adslab_generator` (`fairchem/core/components/calculate/recipes/adsorbml.py`) then
+   sets `atoms.pbc = True`, folding z≈59 back to z≈13 — **inside the slab**.
+4. H now neighbours frozen atoms → `is_adsorbate_intercalated` → discarded. Every
+   placement, before any relaxation.
+
+**Trigger: `2·span > cell_z`** (span = `z.max()−z.min()`), because centring puts the slab
+in `[cell_z/2 − span, cell_z/2]`, which only stays above z=0 when `cell_z ≥ 2·span`.
+Verified against the pre-fix results, r = 0.974 across four families:
+
+| family | 2·span − cell_z | rejected/100 |
+|---|---|---|
+| Mo₂C(110) | −2.4 (safe) | 0.2 |
+| Mo₂C(111) | −4.5 (safe) | 0.8 |
+| Mo₂C(100) | **+1.4** | 20.9 |
+| Mo₂N(001) | **+14.0** | 100.0 |
+
+`pbc = [True, True, False]` is not an option — `FAIRChemCalculator` raises `MixedPBCError`
+on non-uniform PBC and the recipe relaxes this same slab object.
+
+**Why OC20 never hits it:** its own convention is 20 Å vacuum on a ≥7 Å slab, so
+`cell_z ≈ 27 ≫ 2·7`. The bug is latent upstream, which is why conforming to the sizing
+convention below is the actual fix. Two defences, in order:
+
+- `generate_structures.py:_ensure_z_clearance` sets
+  `cell_z = max(span + 20, 2·span + 2)` at the end of **every** builder, and
+  `_assert_sizing_invariants` fails the generator if any emitted structure violates it.
+- `audit_tags.py` reports a `wrap-margin` column (`cell_z − 2·span`) and exits 1 below
+  1 Å, catching hand-edited or externally supplied structures on CPU.
+- `2-run_adsorbml.py` still pads the cell defensively at read time. On conforming inputs
+  it is a no-op; leave it as the net. (Padding is free — MLIP cost scales with atom count,
+  not cell volume; E_slab changed by 0.053 meV when this was measured.)
+
+## Slab sizing convention (OC20)
+
+Structures are sized to OC20 — the dataset UMA's `oc20` head was trained on, and whose DFT
+settings `GPAW_CONFIG` already matches. The numbers are literal, from
+`fairchem/data/oc/core/slab.py`:
+
+```
+SlabGenerator(min_slab_size=7.0, min_vacuum_size=20.0, lll_reduce=False,
+              center_slab=True, primitive=True, max_normal_search=1)
+get_slabs(tol=0.3, bonds=None, max_broken_bonds=0, symmetrize=False)
+tile_atoms(min_ab=8.0)
+```
+
+Constants live at the top of `generate_structures.py`: `MIN_SLAB_THICKNESS 7.0`,
+`MIN_VACUUM 20.0`, `MIN_AB 8.0`, `MIN_AB_DEFECT` (= `MIN_AB`), `MAX_ATOMS_TARGET 250`
+(OC22's ceiling, warning only), `MAX_ATOMS_INTERFACE 600`.
+
+**Two different "thicknesses" — do not conflate them.**
+`_material_thickness()` = atom span + one interlayer spacing; this is what `min_slab_size`
+means. `_atom_span()` = `z.max()−z.min()`; this is what the wrap invariant is about.
+Mo₂N(001) has a 6.00 Å span but **8.00 Å of material** (4 planes, 2.00 Å apart), so it does
+satisfy OC20 despite the span reading below 7.
+
+`create_slab` cuts to a thickness **in Å** via pymatgen `SlabGenerator`. It previously
+passed a layer count to `ase.build.surface`, whose `layers` counts *oriented-unit-cell
+repeats*, not atomic planes — so `layers=4` meant 16 planes / 30 Å for Mo₂N(001) but 9
+planes / 11.8 Å for Mo₂C(111), and 8 stacked monolayers (46 Å) for "MoS₂ basal plane".
+
+⚠ **`create_slab` deliberately does NOT call `standardize_bulk`.** SpacegroupAnalyzer
+standardization swaps Mo₂C's b and c axes (4.725, 6.022, 5.195 → 4.725, 5.195, 6.022),
+which would silently redefine `Mo2C_(110)` as the plane we call (101). Miller indices are
+interpreted in the basis of whatever `create_*_bulk()` returns. Do not "improve" this.
+
+Non-slab families get explicit builders, because a thickness floor is wrong for them:
+`create_tmd_basal_slab` (MoS₂/MoSe₂ — one monolayer, hexagonal `mx2` cell),
+`create_mxene_basal_slab` (one Ti₃C₂O₂ sheet). `create_tmd_monolayer` is separate and stays
+for edge ribbons, which need a rectangular cell. Interfaces pass thicknesses in **Å**
+(`in_layers=False`, 7 Å film + 7 Å substrate); only `create_ni_mxene_interface` passes
+layers, because one "layer" there is one intact O-Ti-C-Ti-C-Ti-O sheet.
+
+Resulting sizes — every structure now has a wrap margin ≥ 5 Å:
+
+| | before | after |
+|---|---|---|
+| pristine slabs (14) | 63–256 atoms, 8–49 Å span | **27–144 atoms, 3.2–11.9 Å** |
+| vacancy/dopant slabs (117) | 430–576 atoms | **25–144 atoms** |
+| `Ni_*_interface_*` (186) | 312–950 atoms | 272–512 atoms |
+| `*_sheet` (8) | 384–768 atoms | **dropped** |
+
+The `_sheet` family is gone: it was a 4×4 yardstick that reproduced the 2×2 value to
+1–3 meV, i.e. it confirmed the smaller cell is converged and then cost 4× per structure.
+
+Known limits of the current sizing:
+- **`termination=0`** is the default and is arbitrary — no more so than the single cut
+  `ase.build.surface` returned, but arbitrary. The list is `get_slabs()` results plus a
+  flipped copy of each asymmetric slab (`_flip_slab_z`), so both faces are reachable:
+  Mo₂C(100) has 2, MoP(001) 2, Mo₂C(110) 3, Mo₂C(111) 7, Mo₂N(001)/(100) 1.
+
+  ⚠ **Two facets changed termination when the engine changed**, because `get_slabs` returns
+  the anion face first where the old ase cut happened to land on metal:
+
+  | | old (ase) | new (`termination=0`) | old surface is now |
+  |---|---|---|---|
+  | `Mo2C_(100)` | Mo-terminated | **C-terminated** | `termination=1` |
+  | `MoP_(001)` | Mo-terminated | **P-terminated** | `termination=1` |
+
+  Everything else keeps its top-layer species ratio. This matters: the Mo₂C(100)
+  ΔG_H = −0.692 eV reference was measured on the **Mo**-terminated surface, so it is not a
+  valid regression target for the current default. Deciding which face to screen (or
+  screening both) is open work — ranking by relaxed `E_slab` is the principled route, and
+  is valid because terminations of one facet share composition and atom count.
+- **`MIN_AB_DEFECT = MIN_AB`** means Mo₂N(001) carries one dopant per 4 top-layer Mo — a
+  doped surface more than an isolated dopant. Raise to 10.0 if that matters. This does
+  *not* fix the separate finding that the best H site lands 5.5–8.6 Å from the dopant;
+  that needs site generation restricted to a radius around the defect, in step 2.
+- **7 Å is an OC20 (metals/alloys) convention.** Mo₂N/Mo₂C/MoB/MoP are compounds; OC22
+  (the compound dataset) uses ≥8 Å, 12 Å vacuum, symmetric slabs, all atoms free. A
+  thickness-convergence check on Mo₂N(001) (7 / 10 / 14 Å) is outstanding.
+- **MoB(111)** has no clean atomic layering (a z-clustering probe collapses its 8.8 Å into
+  one "plane"), so "surface layer" is ill-defined there. Predates this change.
 
 ## Running
 

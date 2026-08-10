@@ -10,15 +10,51 @@ from pathlib import Path
 from ase import Atoms
 from ase.io import write
 from ase.constraints import FixAtoms
-from ase.build import bulk as ase_bulk, surface, mx2, make_supercell
+from ase.build import bulk as ase_bulk, mx2, make_supercell
 from ase.neighborlist import neighbor_list
 from ase.data import covalent_radii
 import numpy as np
 
 from pymatgen.core import Lattice, Structure
+from pymatgen.core.surface import SlabGenerator
 from pymatgen.io.ase import AseAtomsAdaptor
 from pymatgen.analysis.interfaces.zsl import ZSLGenerator
 from pymatgen.analysis.interfaces.coherent_interfaces import CoherentInterfaceBuilder
+
+
+# ── Slab sizing convention (OC20) ────────────────────────────────
+#
+# These are OC20's own numbers, taken from the code that built the dataset UMA's
+# `oc20` head was trained on (fairchem/data/oc/core/slab.py):
+#
+#     SlabGenerator(min_slab_size=7.0, min_vacuum_size=20.0, lll_reduce=False,
+#                   center_slab=True, primitive=True, max_normal_search=1)
+#     get_slabs(tol=0.3, bonds=None, max_broken_bonds=0, symmetrize=False)
+#     tile_atoms(min_ab=8.0)
+#
+# and stated in the OC20 paper as "a depth of at least 7 Å and a width of at least
+# 8 Å" with "a vacuum layer of at least 20 Å". Our DFT settings already match OC20
+# (RPBE / PW 350 eV / no spin / fmax 0.03), so its geometry convention is the
+# self-consistent choice.
+#
+# Two distinct notions of "thickness" matter here and conflating them is what made
+# the old slabs unreviewable:
+#   * MATERIAL thickness = atom span + one interlayer spacing. This is what
+#     `min_slab_size` means, and what "at least 7 Å" refers to.
+#   * ATOM SPAN = z.max() - z.min(). This is what the placement-wrap invariant
+#     below cares about, because the wrap acts on atom positions.
+# Mo2N(001) has a 6.00 Å span but 8.00 Å of material (4 planes, 2.00 Å apart), so
+# it satisfies OC20 despite the span reading below 7.
+MIN_SLAB_THICKNESS = 7.0    # Å, material thickness (OC20 min_slab_size)
+MIN_VACUUM = 20.0           # Å (OC20 min_vacuum_size)
+MIN_AB = 8.0                # Å, both in-plane vectors (OC20 min_ab)
+MAX_ATOMS_TARGET = 250      # OC22's published per-slab ceiling; a warning, not a hard cap
+# ZSL coincidence cells are irreducibly larger: an interface is two slabs, and the
+# in-plane cell is set by the lattice mismatch rather than by any thickness choice.
+# 600 admits every match the current systems produce (largest is Ni/Mo2C(111) at 512)
+# while still catching a regression that blows the cell up -- the pre-fix
+# Ni_MoS2_interface_(100) was 948 atoms. A feasibility guard, not a convention.
+MAX_ATOMS_INTERFACE = 600
 
 
 # ── Validation helpers ───────────────────────────────────────────
@@ -113,6 +149,99 @@ def _assert_film_integrity(interface, substrate_symbol, max_internal_gap, label)
             f"{label}: film is split by a {gaps.max():.1f} A internal vacuum gap "
             f"(> {max_internal_gap} A) -- sheet was sliced, not kept intact"
         )
+
+
+# ── Geometry / sizing helpers ────────────────────────────────────
+
+def _atom_span(atoms):
+    """z.max() - z.min(). The quantity the placement-wrap invariant is about."""
+    z = atoms.get_positions()[:, 2]
+    return float(np.max(z) - np.min(z)) if len(atoms) else 0.0
+
+
+def _material_thickness(atoms, tol=0.5):
+    """Atom span plus one interlayer spacing -- how much material the slab represents.
+
+    This is what pymatgen's `min_slab_size` means. A 4-plane slab with 2.0 Å spacing
+    spans 6.0 Å of positions but stands for 8.0 Å of bulk, because the periodic repeat
+    it was cut from includes the gap above the top plane.
+    """
+    layers = _z_layers(atoms.get_positions()[:, 2], tol=tol)
+    if len(layers) < 2:
+        return _atom_span(atoms)
+    return _atom_span(atoms) + float(np.median(np.diff(layers)))
+
+
+def _tile_to_min_ab(atoms, min_ab=MIN_AB):
+    """Repeat in a and b until both in-plane vectors are at least `min_ab` Å.
+
+    Mirrors OC20's `tile_atoms` (fairchem/data/oc/core/slab.py). Deliberately a
+    threshold on the *cell vectors* rather than a fixed n x n supercell: a fixed
+    repeat count makes the physical width depend on the material's lattice
+    constant, which is how the old (2,2)/(3,3) sizes ended up spanning anywhere
+    from 6.2 to 18 Å.
+    """
+    la = np.linalg.norm(atoms.cell[0])
+    lb = np.linalg.norm(atoms.cell[1])
+    na = int(np.ceil(min_ab / la)) if la > 0 else 1
+    nb = int(np.ceil(min_ab / lb)) if lb > 0 else 1
+    return atoms.repeat((max(na, 1), max(nb, 1), 1))
+
+
+def _flip_slab_z(slab_struct):
+    """Turn a pymatgen Slab upside down, so its other face points along +z.
+
+    `get_slabs` returns each asymmetric slab in one orientation, so without this the
+    opposite termination cannot be built at all. Mirrors what fairchem's `compute_slabs`
+    does with `is_structure_invertible`/`flip_struct`.
+    """
+    flipped = slab_struct.copy()
+    # Mirror through z, then shift back into the cell. Fractional coords keep this exact.
+    flipped = flipped.__class__(
+        lattice=flipped.lattice,
+        species=[site.species for site in flipped],
+        coords=[[c[0], c[1], 1.0 - c[2]] for c in flipped.frac_coords],
+        miller_index=slab_struct.miller_index,
+        oriented_unit_cell=slab_struct.oriented_unit_cell,
+        shift=slab_struct.shift,
+        scale_factor=slab_struct.scale_factor,
+        site_properties=flipped.site_properties,
+    )
+    return flipped
+
+
+def _ensure_z_clearance(atoms, min_vacuum=MIN_VACUUM):
+    """Set cell_z so the slab has `min_vacuum` of vacuum AND cell_z >= 2*span + 2.
+
+    The second condition is not physics -- it is a defence against a bug in
+    fairchem's adsorbate placement. `_get_scaled_normal`
+    (fairchem/data/oc/core/adsorbate_slab_config.py) centres the adsorption site in
+    the cell and calls wrap() to "not deal with pbc issues". Centring puts the slab
+    in [cell_z/2 - span, cell_z/2], which only stays above z=0 when
+    cell_z >= 2*span. Below that, the slab's own underside wraps around to sit
+    ABOVE the site; the overlap solver then lifts H past the top of the cell, and
+    `ocp_adslab_generator` folds it back down INTO the slab, where it neighbours a
+    frozen atom and is discarded as `adsorbate_intercalated`.
+
+    Measured against the pre-fix results the predictor `2*span - cell_z` tracked the
+    observed rejection rate with r = 0.97 (Mo2N(001) +14.0 Å -> 100/100 rejected;
+    Mo2C(100) +1.4 Å -> 21/100; Mo2C(110) -2.4 Å -> 0.2/100).
+
+    With the OC20 convention the vacuum term dominates for every plain slab
+    (span <= 15 Å, vacuum 20 Å), so this only ever binds for the thick ZSL
+    interfaces. Applying it here, once, at the end of every builder, is what makes
+    the invariant true by construction rather than by a downstream patch.
+    """
+    atoms = atoms.copy()
+    span = _atom_span(atoms)
+    atoms.cell[2, 2] = max(span + min_vacuum, 2.0 * span + 2.0)
+    atoms.center(axis=2)
+    if atoms.cell[2, 2] < 2.0 * span:
+        raise ValueError(
+            f"z clearance failed: cell_z {atoms.cell[2, 2]:.2f} Å < 2*span "
+            f"{2 * span:.2f} Å -- adsorbate placement would wrap the slab onto itself"
+        )
+    return atoms
 
 
 # ── Base bulk structures ─────────────────────────────────────────
@@ -283,7 +412,23 @@ def create_ti3c2_bulk():
     return atoms
 
 
-def create_graphene_sheet(size=(4, 4, 1), vacuum=10):
+def create_mxene_basal_slab(min_ab=MIN_AB, vacuum=MIN_VACUUM):
+    """One intact Ti3C2O2 sheet, tiled to `min_ab`.
+
+    `create_ti3c2_bulk` returns exactly one O-Ti-C-Ti-C-Ti-O sheet (6 Å) plus its
+    3 Å vdW gap, so tiling that cell in-plane and re-establishing the vacuum gives
+    the basal slab directly. Routing it through create_slab would ask SlabGenerator
+    to hit a 7 Å thickness target in a 9 Å cell, which either returns the same sheet
+    or cuts through it.
+    """
+    sheet = _tile_to_min_ab(create_ti3c2_bulk(), min_ab)
+    sheet.set_pbc([True, True, False])
+    sheet = _ensure_z_clearance(sheet, min_vacuum=vacuum)
+    _apply_constraints(sheet)
+    return sheet
+
+
+def create_graphene_sheet(size=(4, 4, 1), vacuum=MIN_VACUUM):
     """Create a graphene sheet slab."""
     a = 2.46  # Å, graphene lattice constant
 
@@ -304,11 +449,10 @@ def create_graphene_sheet(size=(4, 4, 1), vacuum=10):
 
     sheet = bulk.repeat(size)
     sheet.set_pbc([True, True, False])
-    sheet.center(vacuum=vacuum, axis=2)
-    return sheet
+    return _ensure_z_clearance(sheet, min_vacuum=vacuum)
 
 
-def create_n_doped_graphene(size=(4, 4, 1), vacuum=10):
+def create_n_doped_graphene(size=(4, 4, 1), vacuum=MIN_VACUUM):
     """Create N-doped graphene (one C replaced by N)."""
     sheet = create_graphene_sheet(size=size, vacuum=vacuum)
     # Replace the C atom closest to center with N
@@ -350,20 +494,101 @@ def _parse_miller(miller):
     return tuple(int(c) for c in digits)
 
 
-def create_slab(bulk_atoms, miller="(100)", size=(2, 2, 4), vacuum=8):
-    """Create a surface slab for a requested Miller index."""
+def create_slab(bulk_atoms, miller="(100)", min_ab=MIN_AB,
+                min_thickness=MIN_SLAB_THICKNESS, vacuum=MIN_VACUUM, termination=0):
+    """Create a surface slab for a requested Miller index, sized to the OC20 convention.
+
+    Cuts to a target thickness in ÅNGSTRÖMS. The previous implementation passed a
+    layer count to `ase.build.surface`, whose `layers` counts *oriented-unit-cell
+    repeats*, not atomic planes -- so `layers=4` meant 16 atomic planes / 30 Å for
+    Mo2N(001) but 9 planes / 11.8 Å for Mo2C(111). Nothing in the code said which,
+    and the resulting 46 Å MoS2 "basal plane" was eight stacked monolayers.
+
+    pymatgen's SlabGenerator is used with OC20's exact parameters, and is called on
+    the bulk cell it was HANDED -- deliberately not routed through fairchem's
+    `standardize_bulk`. SpacegroupAnalyzer standardization permutes Mo2C's axes
+    (4.725, 6.022, 5.195 -> 4.725, 5.195, 6.022), which would silently redefine
+    `Mo2C_(110)` as the plane we currently call (101). Verified equivalent to the old
+    ase cut for that facet: ase (1,1,0) gives 7.65 x 5.20 in-plane, this gives
+    5.20 x 7.65.
+
+    `termination` indexes the distinct terminations available for the facet. Index 0 is
+    the first `get_slabs` result -- arbitrary, but no more so than the single cut
+    `ase.build.surface` used to return. Ranking them by relaxed energy is follow-up work.
+
+    The list includes FLIPPED copies of any slab whose two faces differ, because
+    `get_slabs` returns each asymmetric slab in one orientation only and the opposite
+    termination is simply that slab upside down. Without the flip, one face of every
+    asymmetric slab is unreachable -- e.g. Mo2C(100) and MoP(001) each expose exactly one
+    `get_slabs` termination (anion-terminated), and their metal-terminated faces, which
+    the old `ase.build.surface` cut happened to return, could not be built at all.
+    fairchem's own `compute_slabs` does the same flip for the same reason.
+    """
     indices = _parse_miller(miller)
 
-    # Build an oriented slab first, then expand in-plane for supercell-like coverage.
-    slab = surface(bulk_atoms, indices, layers=size[2], vacuum=vacuum, periodic=True)
-    slab = slab.repeat((size[0], size[1], 1))
+    generator = SlabGenerator(
+        AseAtomsAdaptor.get_structure(bulk_atoms),
+        miller_index=indices,
+        min_slab_size=min_thickness,
+        min_vacuum_size=vacuum,
+        lll_reduce=False,
+        center_slab=True,
+        primitive=True,
+        max_normal_search=1,
+    )
+    # max_broken_bonds=0 keeps the cut from severing bonds, which is what stops a
+    # layered crystal being sliced through the middle of a covalent sandwich.
+    slabs = generator.get_slabs(tol=0.3, bonds=None, max_broken_bonds=0, symmetrize=False)
+    if not slabs:
+        raise ValueError(
+            f"SlabGenerator found no {indices} termination at min_slab_size="
+            f"{min_thickness} Å (max_broken_bonds=0); facet may not be cleavable"
+        )
+    slabs = slabs + [_flip_slab_z(s) for s in slabs if not s.is_symmetric()]
+    if termination >= len(slabs):
+        raise ValueError(
+            f"termination index {termination} out of range: {indices} has "
+            f"{len(slabs)} termination(s) (including flipped faces of asymmetric slabs)"
+        )
+
+    slab = AseAtomsAdaptor.get_atoms(slabs[termination])
+    slab = _tile_to_min_ab(slab, min_ab)
     slab.set_pbc([True, True, False])
-    slab.center(vacuum=vacuum, axis=2)
+    slab = _ensure_z_clearance(slab, min_vacuum=vacuum)
+
+    thickness = _material_thickness(slab)
+    if thickness < min_thickness - 0.5:
+        raise ValueError(
+            f"{indices} slab is only {thickness:.2f} Å of material "
+            f"(< {min_thickness} Å); SlabGenerator under-cut the facet"
+        )
     _apply_constraints(slab)
     return slab
 
 
-def create_edge_ribbon(bulk_atoms, width=6, length=2, vacuum=8, edge_type="Mo",
+def create_tmd_basal_slab(formula, a, thickness, min_ab=MIN_AB, vacuum=MIN_VACUUM):
+    """A single 2H-MX2 monolayer in its HEXAGONAL cell, tiled to `min_ab`.
+
+    The basal plane of a vdW crystal is one monolayer -- that is the model the TMD
+    HER literature uses (3x3 or 4x4 of a monolayer, 12-15 Å vacuum). Cutting it with
+    SlabGenerator instead would obey OC20's 7 Å minimum and hand back two
+    monolayers, and the old `create_slab` route handed back EIGHT (46 Å of MoS2).
+
+    Kept separate from `create_tmd_monolayer`, which returns a rectangular cell
+    because edge ribbons need orthogonal axes to cut a clean finite-in-x strip. Here
+    the hexagonal cell is the right one: it keeps the 3-fold symmetry of the basal
+    plane, so the H site mesh is not biased by an artificial rectangular supercell.
+    """
+    sheet = mx2(formula=formula, kind='2H', a=a, thickness=thickness,
+                size=(1, 1, 1), vacuum=7.5)
+    sheet = _tile_to_min_ab(sheet, min_ab)
+    sheet.set_pbc([True, True, False])
+    sheet = _ensure_z_clearance(sheet, min_vacuum=vacuum)
+    _apply_constraints(sheet)
+    return sheet
+
+
+def create_edge_ribbon(bulk_atoms, width=6, length=2, vacuum=MIN_VACUUM, edge_type="Mo",
                        layers_z=2, edge_depth=1.7, keep_fraction=0.0):
     """Create an edge ribbon: finite in x (two edges), periodic in y, vacuum in x+z.
 
@@ -422,6 +647,10 @@ def create_edge_ribbon(bulk_atoms, width=6, length=2, vacuum=8, edge_type="Mo",
         raise ValueError(f"{edge_type}-edge: keep_fraction={keep_fraction} left nothing to remove")
 
     del ribbon[remove]
+    # Ribbons are excluded from the AdsorbML pipeline today (placement is z-oriented,
+    # and a ribbon's active face points along x), but hold the same z invariant so they
+    # are screenable the moment that changes.
+    ribbon = _ensure_z_clearance(ribbon, min_vacuum=vacuum)
     _apply_constraints(ribbon)
     return ribbon
 
@@ -545,20 +774,32 @@ def add_cluster_on_surface(slab, element, n_atoms=2, height=1.8, spacing=2.4):
 
     for dx, dy in offsets:
         slab += Atoms(element, positions=[[center_xy[0] + dx, center_xy[1] + dy, z_max + height]])
-    return slab
+    # The cluster raises the atom span, so re-establish the z invariant here rather
+    # than leaving each caller to remember it.
+    return _ensure_z_clearance(slab)
 
 
 def _build_zsl_interface(substrate_atoms, film_atoms, substrate_miller, film_miller,
-                          separation=2.2, vacuum=15.0, strain_tol=0.02,
-                          substrate_thickness=4, film_thickness=2, max_atoms=None):
+                          separation=2.2, vacuum=MIN_VACUUM, strain_tol=0.02,
+                          substrate_thickness=MIN_SLAB_THICKNESS,
+                          film_thickness=MIN_SLAB_THICKNESS, in_layers=False,
+                          max_atoms=MAX_ATOMS_INTERFACE):
     """Lattice-match a substrate/film pair with pymatgen ZSL and return a combined ASE slab.
 
     Replaces the old concatenate-then-set_cell(substrate.cell) approach, which never
     lattice-matched the two in-plane periodicities and wrapped mismatched atoms on
     top of each other (0.22-0.92 A overlaps).
 
-    `max_atoms`, if set, rejects coincidence cells above that size (GPAW
-    feasibility); the smallest-strain match that also fits is returned.
+    Thicknesses default to ANGSTROMS (`in_layers=False`), matching OC20's 7 A, rather
+    than pymatgen's default of LAYERS. Passing layers is how the MoS2 interfaces ended
+    up 31-39 A thick: `film_thickness=2` meant two 12.3 A bulk repeats, i.e. four
+    monolayers. Callers that genuinely need a layer count -- the MXene, where one
+    "layer" is one intact O-Ti-C-Ti-C-Ti-O sheet -- pass `in_layers=True` explicitly.
+
+    `max_atoms` rejects coincidence cells above that size; the smallest-strain match
+    that also fits is returned. It defaults to MAX_ATOMS_INTERFACE rather than OC22's
+    250-atom ceiling, because a ZSL coincidence cell is set by the lattice mismatch and
+    not by thickness -- at 250 every current Ni/MoX match would be rejected.
     """
     substrate_struct = AseAtomsAdaptor.get_structure(substrate_atoms)
     film_struct = AseAtomsAdaptor.get_structure(film_atoms)
@@ -577,6 +818,7 @@ def _build_zsl_interface(substrate_atoms, film_atoms, substrate_miller, film_mil
         for interface in builder.get_interfaces(
             termination, gap=separation, vacuum_over_film=vacuum,
             film_thickness=film_thickness, substrate_thickness=substrate_thickness,
+            in_layers=in_layers,
         ):
             strain = interface.interface_properties['von_mises_strain']
             if strain <= strain_tol:
@@ -588,13 +830,25 @@ def _build_zsl_interface(substrate_atoms, film_atoms, substrate_miller, film_mil
     # can still produce a short in-plane contact within the film or substrate
     # sublattice. Reject those explicitly instead of trusting strain alone.
     too_big = 0
+    too_narrow = 0
     for strain, interface, termination in candidates:
         atoms = AseAtomsAdaptor.get_atoms(interface)
         atoms.set_pbc([True, True, False])
         if max_atoms is not None and len(atoms) > max_atoms:
             too_big += 1
             continue
+        # ZSL happily returns extremely elongated coincidence cells -- Ni/MoB(111)'s
+        # lowest-strain match is 4.31 x 51.07 Å, which would put periodic H images
+        # 4.3 Å apart. Skip to the next-lowest-strain match rather than accept a cell
+        # too narrow to hold an isolated adsorbate.
+        if min(np.linalg.norm(atoms.cell[0]), np.linalg.norm(atoms.cell[1])) < MIN_AB - 0.01:
+            too_narrow += 1
+            continue
         if _min_covalent_radius_ratio(atoms) >= 1.0:
+            # An interface is substrate + film stacked, so it is the one family thick
+            # enough that `vacuum_over_film` alone can leave 2*span > cell_z. This is
+            # where _ensure_z_clearance's second branch actually does work.
+            atoms = _ensure_z_clearance(atoms, min_vacuum=vacuum)
             print(f"[ZSL termination={termination} strain={strain:.3%} natoms={len(atoms)}] ", end="")
             return atoms
 
@@ -604,12 +858,12 @@ def _build_zsl_interface(substrate_atoms, film_atoms, substrate_miller, film_mil
             f"substrate_miller={substrate_miller}, film_miller={film_miller} "
             f"(mismatched lattices; refusing to emit an overlapping structure)"
         )
-    if too_big and too_big == len(candidates):
+    if too_big + too_narrow == len(candidates):
         raise ValueError(
             f"All {len(candidates)} ZSL match(es) within {strain_tol:.1%} strain for "
-            f"substrate_miller={substrate_miller}, film_miller={film_miller} exceed the "
-            f"{max_atoms}-atom cap (smallest-strain match still too large); "
-            f"too big for GPAW"
+            f"substrate_miller={substrate_miller}, film_miller={film_miller} were "
+            f"rejected: {too_big} exceed the {max_atoms}-atom cap, {too_narrow} are "
+            f"narrower than min_ab {MIN_AB} Å in one direction"
         )
     raise ValueError(
         f"All {len(candidates)} ZSL match(es) within {strain_tol:.1%} strain for "
@@ -652,13 +906,20 @@ def create_ni_mxene_interface(miller="(111)", separation=2.2, strain_tol=0.03, m
     only selects the Ni substrate facet. Strain tol is relaxed to 3% and a
     350-atom cap applied so a GPAW-feasible coincidence cell can win; if none
     fits, _build_zsl_interface raises and the caller records it UMA-only.
+
+    This is the one caller that passes thicknesses in LAYERS rather than Å: one
+    "layer" of the film is one intact O-Ti-C-Ti-C-Ti-O sheet, which is exactly the
+    quantity we want to hold at 1, and an Å target would cut through it. 4 Ni layers
+    is 7.1 Å of material on (100) and 8.1 Å on (111), so the substrate still clears
+    OC20's 7 Å.
     """
     ni_bulk = ase_bulk("Ni", "fcc", a=3.52, cubic=True)
     mxene_bulk = create_ti3c2_bulk()
     indices = _parse_miller(miller)
     interface = _build_zsl_interface(
         ni_bulk, mxene_bulk, substrate_miller=indices, film_miller=(0, 0, 1),
-        separation=separation, strain_tol=strain_tol, film_thickness=1,
+        separation=separation, strain_tol=strain_tol,
+        in_layers=True, film_thickness=1, substrate_thickness=4,
         max_atoms=max_atoms,
     )
     _assert_substrate_facet(interface, "Ni", indices, label=f"Ni/MXene {miller}")
@@ -669,7 +930,7 @@ def create_ni_mxene_interface(miller="(111)", separation=2.2, strain_tol=0.03, m
     return interface
 
 
-def create_ni_on_graphene(ni_atoms=4, height=1.8, size=(4, 4, 1), vacuum=10):
+def create_ni_on_graphene(ni_atoms=4, height=1.8, size=(4, 4, 1), vacuum=MIN_VACUUM):
     """Create Ni cluster on graphene sheet."""
     sheet = create_graphene_sheet(size=size, vacuum=vacuum)
     sheet = add_cluster_on_surface(sheet, "Ni", n_atoms=ni_atoms, height=height)
@@ -677,7 +938,7 @@ def create_ni_on_graphene(ni_atoms=4, height=1.8, size=(4, 4, 1), vacuum=10):
     return sheet
 
 
-def create_ni_on_n_doped_graphene(ni_atoms=4, height=1.8, size=(4, 4, 1), vacuum=10):
+def create_ni_on_n_doped_graphene(ni_atoms=4, height=1.8, size=(4, 4, 1), vacuum=MIN_VACUUM):
     """Create Ni cluster on N-doped graphene sheet."""
     sheet = create_n_doped_graphene(size=size, vacuum=vacuum)
     sheet = add_cluster_on_surface(sheet, "Ni", n_atoms=ni_atoms, height=height)
@@ -685,7 +946,7 @@ def create_ni_on_n_doped_graphene(ni_atoms=4, height=1.8, size=(4, 4, 1), vacuum
     return sheet
 
 
-def create_graphene_nanoribbon(width=6, length=3, vacuum=8):
+def create_graphene_nanoribbon(width=6, length=3, vacuum=MIN_VACUUM):
     """Create armchair graphene nanoribbon (CNT-like approximation)."""
     a = 2.46
     cell = np.array([
@@ -703,8 +964,8 @@ def create_graphene_nanoribbon(width=6, length=3, vacuum=8):
 
     ribbon = bulk.repeat((width, length, 1))
     ribbon.center(vacuum=vacuum, axis=0)
-    ribbon.center(vacuum=vacuum, axis=2)
     ribbon.set_pbc([False, True, False])
+    ribbon = _ensure_z_clearance(ribbon, min_vacuum=vacuum)
     _apply_constraints(ribbon)
     return ribbon
 
@@ -738,8 +999,13 @@ DATA_INPUTS = REPO_ROOT / "data" / "inputs" / "VASP_inputs"
 # Facets per material. Hexagonal/tetragonal materials get basal + physically
 # meaningful facets instead of cubic-motivated (100)/(110)/(111); materials not
 # listed keep the historical cubic-ish default (Mo2C, MoB - out of scope for
-# this pass; ase.build.surface() cuts these Miller strings correctly regardless
+# this pass; pymatgen's SlabGenerator cuts these Miller strings correctly regardless
 # of crystal system, so no parser change is needed for any of them).
+#
+# Miller indices are interpreted in the basis of the bulk cell each create_*_bulk()
+# returns -- create_slab deliberately does not standardize the cell first, because
+# SpacegroupAnalyzer standardization swaps Mo2C's b and c axes and would silently
+# redefine (110) as the plane we call (101).
 DEFAULT_MILLERS = ['(100)', '(110)', '(111)']
 FACETS = {
     'MoS2': ['(001)'],
@@ -748,11 +1014,23 @@ FACETS = {
     'Mo2N': ['(001)', '(100)', '(111)', '(112)'],
 }
 
-# In-plane supercell for defect/dopant slabs (dilutes the defect vs. its
-# periodic images; ~1/9 coverage instead of the old 1/4 from a 2x2 cell).
-DEFECT_SIZE = (3, 3, 4)
+# In-plane width for defect/dopant slabs, in Å of defect-image separation.
+#
+# Deliberately the same as MIN_AB. A larger threshold buys nothing here because
+# tiling is discrete: MoB(110)'s primitive surface vector is 8.76 Å, so demanding
+# 12 Å jumps it to 17.5 Å and 192 atoms. At 8 Å every defect cell lands between
+# 8.0 and 14.0 Å of separation for 27-144 atoms, which is the range the
+# single-dopant/vacancy HER literature uses (the MoS2 S-vacancy work uses 3x3,
+# ~9.5 Å), and no structure exceeds MAX_ATOMS_TARGET.
+#
+# The trade-off is coverage: Mo2N(001) at 2x2 is one dopant per four top-layer Mo,
+# which reads as a doped surface more than an isolated dopant. Raise this to 10.0
+# if a dopant-image convergence check shows it matters. Note this does NOT fix the
+# separate finding that the best H site lands far from the dopant -- that needs
+# site generation restricted to a radius around the defect, in AdsorbML step 2.
+MIN_AB_DEFECT = MIN_AB
 
-# 2H-TMD monolayer params for edge ribbons: (in-plane a, S-S vertical thickness) Å.
+# 2H-TMD monolayer params: (in-plane a, S-S vertical thickness) Å.
 TMD_PARAMS = {
     'MoS2':  (3.160, 3.19),
     'MoSe2': (3.289, 3.34),
@@ -832,36 +1110,42 @@ def generate_all_structures(include_glob=None, out_dir=None, list_only=False, dr
             failures.append((formula, str(e)))
             continue
 
+        # The 2H-TMD basal plane is ONE monolayer, not a thickness-cut slab: it is a
+        # vdW crystal, so any "at least 7 Å" rule hands back a stack of sheets held
+        # together by nothing. (The old layer-count route handed back eight.)
+        if formula in TMD_PARAMS:
+            tmd_a, tmd_t = TMD_PARAMS[formula]
+            for miller in FACETS[formula]:
+                write_structure(f"{formula}_{miller}",
+                    lambda f=formula, a=tmd_a, t=tmd_t: create_tmd_basal_slab(f, a=a, thickness=t))
+            continue
+
         for miller in FACETS.get(formula, DEFAULT_MILLERS):
             write_structure(f"{formula}_{miller}",
                 lambda m=miller, b=bulk: create_slab(b.copy(), miller=m))
 
-    # ── Part 2: Chalcogenide variants (vacancies, edges, sheets) ─
+    # ── Part 2: Chalcogenide variants (vacancies, edges) ──────────
     for formula, vac_sym in chalcogenides.items():
         print(f"\n{formula} variants:")
-        bulk = builders[formula]()
         facets = FACETS[formula]
-        print(f"    [defect supercell] {DEFECT_SIZE[0]}x{DEFECT_SIZE[1]} in-plane -> "
-              f"~{100 / (DEFECT_SIZE[0] * DEFECT_SIZE[1]):.1f}% coverage")
+        tmd_a, tmd_t = TMD_PARAMS[formula]
+        print(f"    [defect cell] min_ab {MIN_AB_DEFECT} A of defect-image separation")
 
         for miller in facets:
-            # Single vacancy
+            # Vacancies are cut into the same single monolayer as the pristine basal
+            # slab, so pristine and defected differ only by the missing atom.
             write_structure(f"{formula}_{miller}_vac{vac_sym}",
-                lambda m=miller: create_vacancy_slab(
-                    create_slab(bulk.copy(), miller=m, size=DEFECT_SIZE), vac_sym))
-            # Double vacancy
+                lambda f=formula, a=tmd_a, t=tmd_t: create_vacancy_slab(
+                    create_tmd_basal_slab(f, a=a, thickness=t, min_ab=MIN_AB_DEFECT), vac_sym))
             write_structure(f"{formula}_{miller}_vac2{vac_sym}",
-                lambda m=miller: create_multi_vacancy_slab(
-                    create_slab(bulk.copy(), miller=m, size=DEFECT_SIZE), vac_sym, count=2))
-            # Nanosheet
-            write_structure(f"{formula}_{miller}_sheet",
-                lambda m=miller: create_slab(bulk.copy(), miller=m, size=(4, 4, 4), vacuum=10))
+                lambda f=formula, a=tmd_a, t=tmd_t: create_multi_vacancy_slab(
+                    create_tmd_basal_slab(f, a=a, thickness=t, min_ab=MIN_AB_DEFECT),
+                    vac_sym, count=2))
 
         # Edge ribbons cut from a single MONOLAYER (layers_z=1), not the 2-sheet
         # bulk -- the old ribbons were accidental bilayer rods. Mo-edge and
         # X(=S/Se)-edge are the two zigzag terminations; the Mo-edge is the
         # literature HER-active site.
-        tmd_a, tmd_t = TMD_PARAMS[formula]
         mono = create_tmd_monolayer(formula, a=tmd_a, thickness=tmd_t)
         # Mo-edge kept at ~50% anion coverage (HER-active reconstruction);
         # anion-edge is the bare chalcogen termination.
@@ -888,30 +1172,29 @@ def generate_all_structures(include_glob=None, out_dir=None, list_only=False, dr
         bulk = builders[formula]()
         metal, anion = info['metal'], info['anion']
         facets = FACETS.get(formula, DEFAULT_MILLERS)
-        print(f"    [defect supercell] {DEFECT_SIZE[0]}x{DEFECT_SIZE[1]} in-plane -> "
-              f"~{100 / (DEFECT_SIZE[0] * DEFECT_SIZE[1]):.1f}% coverage")
+        print(f"    [defect cell] min_ab {MIN_AB_DEFECT} A of defect-image separation")
 
         for miller in facets:
             # Anion vacancy
             write_structure(f"{formula}_{miller}_vac{anion}",
                 lambda m=miller: create_vacancy_slab(
-                    create_slab(bulk.copy(), miller=m, size=DEFECT_SIZE), anion))
+                    create_slab(bulk.copy(), miller=m, min_ab=MIN_AB_DEFECT), anion))
             # Metal vacancy
             write_structure(f"{formula}_{miller}_vac{metal}",
                 lambda m=miller: create_vacancy_slab(
-                    create_slab(bulk.copy(), miller=m, size=DEFECT_SIZE), metal))
+                    create_slab(bulk.copy(), miller=m, min_ab=MIN_AB_DEFECT), metal))
             # Double vacancies
             write_structure(f"{formula}_{miller}_vac2{anion}",
                 lambda m=miller: create_multi_vacancy_slab(
-                    create_slab(bulk.copy(), miller=m, size=DEFECT_SIZE), anion, count=2))
+                    create_slab(bulk.copy(), miller=m, min_ab=MIN_AB_DEFECT), anion, count=2))
             write_structure(f"{formula}_{miller}_vac2{metal}",
                 lambda m=miller: create_multi_vacancy_slab(
-                    create_slab(bulk.copy(), miller=m, size=DEFECT_SIZE), metal, count=2))
+                    create_slab(bulk.copy(), miller=m, min_ab=MIN_AB_DEFECT), metal, count=2))
             # Metal-site dopants
             for dopant in dopants:
                 write_structure(f"{formula}_{miller}_dop{dopant}",
                     lambda m=miller, d=dopant: create_substitution_slab(
-                        create_slab(bulk.copy(), miller=m, size=DEFECT_SIZE), metal, d))
+                        create_slab(bulk.copy(), miller=m, min_ab=MIN_AB_DEFECT), metal, d))
 
         # Edge ribbons for Mo2C and MoB
         if formula in ('Mo2C', 'MoB'):
@@ -921,10 +1204,11 @@ def generate_all_structures(include_glob=None, out_dir=None, list_only=False, dr
                 write_structure(f"{formula}_edge_{label}_large",
                     lambda et=edge_type: create_edge_ribbon(bulk.copy(), width=10, length=3, edge_type=et))
 
-            # Nanosheet
-            for miller in facets:
-                write_structure(f"{formula}_{miller}_sheet",
-                    lambda m=miller: create_slab(bulk.copy(), miller=m, size=(4, 4, 4), vacuum=10))
+        # The `_sheet` family (a 4x4 slab at 4x the atoms) is not emitted any more.
+        # It existed as a numerical yardstick and it did its job: it reproduced the
+        # 2x2 value to 1-3 meV, confirming the smaller in-plane cell is converged.
+        # Keeping 8 such structures in a campaign that is GPU-bound buys nothing.
+        # (graphene_sheet is unrelated despite the name -- it is a real structure.)
 
     # ── Part 4: Ni/MoX interfaces ────────────────────────────────
     for sys_name, info in interface_systems.items():
@@ -955,10 +1239,13 @@ def generate_all_structures(include_glob=None, out_dir=None, list_only=False, dr
 
     # Bare MXene slab: only the basal (001) monolayer is physical. Non-basal
     # cuts of a single-sheet vdW cell are ribbon-stack artifacts (40 Å in-plane
-    # vacuum), so only (001) with a single sheet (size z=1) is emitted.
-    mxene_bulk = create_ti3c2_bulk()
+    # vacuum), so only (001) with a single sheet is emitted.
+    #
+    # Built by tiling the bulk cell directly rather than through create_slab: the
+    # bulk cell already IS one O-Ti-C-Ti-C-Ti-O sheet plus its vdW gap, so a
+    # thickness-targeted cut would either return the same thing or slice the sheet.
     write_structure("Ti3C2O2_(001)",
-        lambda: create_slab(mxene_bulk.copy(), miller="(001)", size=(3, 3, 1), vacuum=10))
+        lambda: create_mxene_basal_slab())
 
     # Ni/MXene interfaces
     for miller in interface_millers:
@@ -1010,6 +1297,49 @@ def generate_all_structures(include_glob=None, out_dir=None, list_only=False, dr
     return failures
 
 
+# Families that are legitimately thinner than MIN_SLAB_THICKNESS or narrower than
+# MIN_AB in one direction, and why. Anything not listed here must meet both.
+#   *_edge_*, *nanoribbon* : finite in x on purpose -- x is vacuum, not a cell width
+#   MoS2/MoSe2/Ti3C2/graphene basal : single sheets; a thickness floor would stack them
+_THIN_OK = ("_edge_", "nanoribbon", "graphene", "MoS2_(001)", "MoSe2_(001)", "Ti3C2O2_(001)")
+_NARROW_OK = ("_edge_", "nanoribbon", "on_nanoribbon")
+
+
+def _assert_sizing_invariants(name, slab):
+    """Gate every emitted structure on the OC20 sizing convention.
+
+    The placement-wrap check is the one that matters: it is the invariant whose
+    violation silently produced zero H* candidates for all 48 Mo2N structures, and
+    it was invisible because nothing downstream looked at cell geometry. Checking it
+    at write time means a regression in any builder fails the generator, not a GPU run.
+    """
+    span = _atom_span(slab)
+    cell_z = float(slab.cell[2, 2])
+    if cell_z < 2.0 * span + 1.0:
+        raise ValueError(
+            f"placement-wrap invariant violated: cell_z {cell_z:.2f} Å < 2*span + 1 "
+            f"({2 * span + 1.0:.2f} Å). fairchem would fold the adsorbate into the slab; "
+            f"see _ensure_z_clearance"
+        )
+
+    la, lb = (float(np.linalg.norm(slab.cell[i])) for i in (0, 1))
+    if min(la, lb) < MIN_AB - 0.01 and not any(k in name for k in _NARROW_OK):
+        raise ValueError(
+            f"in-plane width {la:.2f} x {lb:.2f} Å is below OC20's min_ab {MIN_AB} Å"
+        )
+
+    thickness = _material_thickness(slab)
+    if thickness < MIN_SLAB_THICKNESS - 0.5 and not any(k in name for k in _THIN_OK):
+        raise ValueError(
+            f"material thickness {thickness:.2f} Å is below OC20's "
+            f"min_slab_size {MIN_SLAB_THICKNESS} Å"
+        )
+
+    cap = MAX_ATOMS_INTERFACE if "interface" in name else MAX_ATOMS_TARGET
+    if len(slab) > cap:
+        print(f"[{len(slab)} atoms > {cap} target] ", end="")
+
+
 def _write_structure(base_dir, name, builder_fn, include_glob=None,
                       list_only=False, dry_run=False, failures=None):
     """Helper: build a structure and write its POSCAR (or validate/list only)."""
@@ -1033,6 +1363,7 @@ def _write_structure(base_dir, name, builder_fn, include_glob=None,
                 f"atom overlap: min covalent-radius ratio {ratio:.2f} < 1.0 "
                 f"(some pair closer than a physical bond)"
             )
+        _assert_sizing_invariants(name, slab)
         if dry_run:
             print(f"✓ (dry-run, {len(slab)} atoms, not written)")
             return
@@ -1041,7 +1372,11 @@ def _write_structure(base_dir, name, builder_fn, include_glob=None,
         print(f"✓ ({len(slab)} atoms)")
     except Exception as e:
         print(f"✗ Error: {e}")
-        if poscar_file.exists():
+        # Only ever remove a POSCAR this call was actually trying to write. The unlink
+        # used to be unconditional, so `--dry-run` -- whose entire contract is to touch
+        # nothing -- deleted the existing input for every structure that failed to build.
+        # That is exactly the "never clobber data/" rule the repo warns about.
+        if not dry_run and poscar_file.exists():
             poscar_file.unlink()
         if failures is not None:
             failures.append((name, str(e)))

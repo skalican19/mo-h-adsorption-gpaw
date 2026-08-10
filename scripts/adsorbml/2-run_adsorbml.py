@@ -56,7 +56,7 @@ from _common import (
     setup_logging, parse_millers, get_shard, apply_shard,
     write_atomic_csv, run_gpu_workers,
 )
-from tagging import tag_and_constrain
+from tagging import retag_relaxed
 
 _CANDIDATES_COLS = [
     "candidate_rank", "E_adslab_ml_eV", "E_slab_ml_eV",
@@ -139,16 +139,55 @@ def process_row(item, calc) -> None:
 
     try:
         atoms = ase.io.read(slab_file)
+        # Make z non-periodic BEFORE handing the slab to fairchem.
+        #
+        # fairchem's _get_scaled_normal (adsorbate_slab_config.py) centres the adsorption
+        # site in the cell and calls wrap() to "not deal with pbc issues". With pbc z=True
+        # that wraps the BOTTOM of the slab around to sit ABOVE the site, so the
+        # overlap solver pushes H up to clear those phantom atoms — ~20 Å up for Mo2N,
+        # outside the cell entirely. ocp_adslab_generator then sets pbc=True on the
+        # adslab, folding H back down INTO the slab, where it neighbours frozen atoms and
+        # is discarded as `adsorbate_intercalated`.
+        #
+        # It bites whenever the slab is more than half the cell height, i.e.
+        # 2*thickness > cell_z, because that is when the wrap reaches above the site.
+        # Measured against the pre-fix results, that predictor tracks the observed
+        # rejection rate with r = 0.97: Mo2N(001) +14.0 Å -> 100/100 rejected,
+        # Mo2C(100) +1.4 Å -> 21/100, Mo2C(110) -2.4 Å -> 0.2/100.
+        #
+        # The obvious fix -- pbc z=False -- is not available: FAIRChemCalculator raises
+        # MixedPBCError on non-uniform PBC, and the recipe relaxes this same slab. So
+        # instead give the wrap nothing to bring up: centring the site puts the slab in
+        # [cell_z/2 - thickness, cell_z/2], which stays above z=0 exactly when
+        # cell_z >= 2*thickness. Padding the vacuum to satisfy that keeps pbc uniform.
+        # It is free: MLIP cost scales with atom count, not cell volume, and the vacuum
+        # gap already exceeds the model cutoff so no z-image interacts (E_slab verified
+        # unchanged to <1 meV).
+        _z = atoms.positions[:, 2]
+        _needed = 2.0 * (_z.max() - _z.min()) + 2.0
+        if atoms.cell[2, 2] < _needed:
+            # A WARNING, not info: inputs from generate_structures.py satisfy this by
+            # construction (_ensure_z_clearance), so reaching here means the slab came
+            # from somewhere else and nothing checked it. The padding fixes it, but the
+            # provenance is worth knowing.
+            comp_log.warning(f"  padding cell z {atoms.cell[2, 2]:.1f} -> {_needed:.1f} Å so the "
+                             f"placement wrap cannot lift the slab bottom above the site "
+                             f"(input does not meet the generator's z-clearance invariant)")
+            atoms.cell[2, 2] = _needed
+            atoms.center(axis=2)
         # Re-tag on the RELAXED geometry. Step 1 tagged the unrelaxed slab, and a surface
         # that reconstructs during relaxation can expose an atom that was legitimately
         # buried when it was frozen — every H placement near it would then be rejected as
         # intercalated. This is the last point before placements are generated, so it is
         # the right place to correct for that. No model calls, so it is nearly free.
-        before = list(atoms.get_tags())
-        atoms = tag_and_constrain(atoms, log=comp_log)
-        moved = sum(1 for a, b in zip(before, atoms.get_tags()) if a != b)
-        if moved:
-            comp_log.info(f"Re-tagged relaxed slab: {moved} atom(s) changed tag since step 1")
+        # retag_relaxed only ever ADDS free atoms. Recomputing from scratch here would
+        # also remove some, because a rumpled surface defeats both the height window and
+        # the layer clustering — on Mo2N(001) that cost 8 of 24 free atoms.
+        n_free_before = int(sum(1 for t in atoms.get_tags() if t == 1))
+        atoms = retag_relaxed(atoms, log=comp_log)
+        n_free_after = int(sum(1 for t in atoms.get_tags() if t == 1))
+        if n_free_after != n_free_before:
+            comp_log.info(f"Re-tagged relaxed slab: free atoms {n_free_before} -> {n_free_after}")
         slab  = Slab(bulk=None, slab_atoms=atoms, millers=millers,
                      shift=None, top=None, oriented_bulk=None)
     except Exception as exc:
