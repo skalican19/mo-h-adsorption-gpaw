@@ -196,9 +196,54 @@ repeats*, not atomic planes — so `layers=4` meant 16 planes / 30 Å for Mo₂N
 planes / 11.8 Å for Mo₂C(111), and 8 stacked monolayers (46 Å) for "MoS₂ basal plane".
 
 ⚠ **`create_slab` deliberately does NOT call `standardize_bulk`.** SpacegroupAnalyzer
-standardization swaps Mo₂C's b and c axes (4.725, 6.022, 5.195 → 4.725, 5.195, 6.022),
-which would silently redefine `Mo2C_(110)` as the plane we call (101). Miller indices are
-interpreted in the basis of whatever `create_*_bulk()` returns. Do not "improve" this.
+standardization swaps Mo₂C's b and c axes (4.7285, 6.0526, 5.2098 → 4.7285, 5.2098,
+6.0526), which would silently redefine `Mo2C_(110)` as the plane we call (101). Miller
+indices are interpreted in the basis of whatever `create_*_bulk()` returns. Do not
+"improve" this. **The same trap applies to any external source of lattice constants** —
+Materials Project lists `mp-1552` in the standardized order, so its numbers are
+transcribed into `create_mo2c_bulk` **permuted back** into our setting. Verified after the
+switch: all three Mo₂C facets keep their atom count and top-layer composition.
+
+### Lattice constants — MP-relaxed (PBE), except Ni
+
+Switched 2026-08-12 from experimental to Materials-Project-relaxed values, retrieved from
+MP's **public OPTIMADE mirror** (`optimade.materialsproject.org` — no API key required;
+note `chemical_formula_reduced` is alphabetical, so Mo₂C is `CMo2`, and it returns
+*primitive* cells). Each was matched **by space group** against the builder's own
+`from_spacegroup` call, never by formula — formula-matching is how the wrong polymorphs
+got in originally.
+
+Rationale: OC20 is **PBE geometry + RPBE energetics** — it cut slabs from MP's PBE-relaxed
+cells and computed energies with RPBE at fixed cell. Since nothing in either pipeline ever
+relaxes a cell, whatever is written in the builders is frozen through to ΔG_H, so it should
+be the geometry the `oc20` head was trained on. Measured for contrast: **RPBE prefers ~1 %
+larger constants than PBE** (fcc Ni 3.564 vs 3.513), so relaxing our own bulks under RPBE
+would move *away* from the training distribution.
+
+| material | mp-id | was (exp.) | now (MP) |
+|---|---|---|---|
+| MoS₂ 2H | `mp-2815` | 3.160 / 12.295 | 3.1922 / 13.3783 |
+| MoSe₂ 2H | `mp-1634` | 3.289 / 12.929 | 3.3223 / 13.5430 |
+| MoP WC | `mp-219` | 3.23 / 3.21 | 3.2348 / 3.1823 |
+| Mo₂N | `mp-27953` | 4.20 / 8.00 | 4.2556 / 7.9502 |
+| Mo₂C | `mp-1552` | 4.725 / 6.022 / 5.195 | 4.7285 / 6.0526 / 5.2098 ⚠ permuted |
+| MoB | `mp-1890` | 3.105 / 16.97 | 3.1162 / 16.9892 |
+| **Ni** | ~~`mp-23`~~ | 3.52 | **3.52 — unchanged, see below** |
+| graphene | — | 2.46 | 2.46 — experiment and PBE agree |
+
+Two judgement calls baked in:
+- **The TMD c-axes are PBE's, and PBE gets them wrong** (+5–9 %) because it has no
+  dispersion and cannot hold a vdW gap. Taken anyway for OC20 consistency; near-harmless
+  because every MoS₂/MoSe₂ structure built here is a single monolayer, where bulk c
+  barely enters.
+- **Ni keeps 3.52 and does NOT take MP's 3.4751.** MP's Ni disagrees with *published PBE*
+  Ni (3.513) by 1.1 % — same functional, so not a method difference but an outlier.
+  The obvious explanation was tested and **refuted**: measured in this repo's RPBE/PW(350),
+  fcc Ni relaxes to 3.5642 Å spin-polarized (m = 0.668 μB, exp. 0.62) vs 3.5561 Å
+  non-magnetic — a magnetovolume effect of only **0.23 %**, where MP's deficit is 1.4 %.
+  So the small value is unexplained, and Ni is the substrate of all 186 interfaces with
+  only 4 atoms of cap headroom. `MoS2` Mo–S and `MoB` B–Mo coordination cutoffs now have
+  <0.08 Å of margin; re-check them if a constant moves again.
 
 Non-slab families get explicit builders, because a thickness floor is wrong for them:
 `create_tmd_basal_slab` (MoS₂/MoSe₂ — one monolayer, hexagonal `mx2` cell),
@@ -294,10 +339,17 @@ Known limits of the current sizing:
   adsorbate can reach. `MoP_(001)` is also anion-only but has no defect variants.
   Resolving them needs the termination decision above, not a looser threshold.
 - ~~**MoB(111)** has no clean atomic layering~~ — **wrong, and it was never about MoB.**
-  MoB(111) resolves cleanly into **9** layers. The facets that collapsed to a single
-  "plane" were `Mo2C_(110)` and `Mo2C_(111)`, and the cause was the layer-grouping bug in
-  `_z_layers` (chaining against the previous atom instead of the layer's highest), now
-  fixed by delegating to `tagging.layer_groups`. Post-fix they read 16 and 21 layers.
+  MoB(111) resolves cleanly into **9** layers. Two separate things were conflated here:
+  - `Mo2C_(110)`/`Mo2C_(111)` collapsed to a single "plane" because of the chaining bug in
+    `_z_layers` (comparing against the previous atom instead of the layer's highest), now
+    fixed by delegating to `tagging.layer_groups`. Post-fix: 16 and 21 layers.
+  - **`Mo2C_(111)` separately has genuinely ill-defined layering** — this is where the
+    "no clean atomic layering" observation actually belongs. Its interlayer gaps span
+    0.40–0.85 Å with a **median of 0.53 Å**, straddling the 0.5 Å tolerance, so the layer
+    count is tolerance-dependent: 30 layers at tol 0.3, 21 at 0.5, 13 at 0.8. Expect ±1
+    on any recount after a lattice change; it is noise, not a changed cut. Harmless for
+    the sizing gates (`_material_thickness` ≈ 11.9 Å vs the 7 Å floor) but do not treat
+    that number as meaningful for this facet.
 
 ### Thickness convergence (Mo₂N(001), UMA, 2026-08-10)
 

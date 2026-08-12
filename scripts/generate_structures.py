@@ -73,7 +73,26 @@ MAX_ATOMS_INTERFACE = 600
 # spacing table below. It lives here as one constant because the table is a
 # regression guard derived FROM it: change the value in the `ase_bulk` calls alone
 # and the guard silently starts asserting the wrong spacing.
-NI_A = 3.52                 # Å
+#
+# ⚠ This is EXPERIMENTAL (3.524), deliberately NOT Materials Project's 3.4751, even
+# though the six Mo bulks below did switch to MP-relaxed values. MP's Ni is an outlier:
+# it disagrees with PUBLISHED PBE Ni (3.513, arXiv:2307.06291) by 1.1 % -- same
+# functional, so that is not a method difference. The obvious explanation, that MP ran
+# it non-magnetically, was tested and REFUTED: measured here in RPBE/PW(350), fcc Ni
+# relaxes to 3.5642 Å spin-polarized (m = 0.668 muB, exp. 0.62) and 3.5561 Å
+# non-magnetic -- a magnetovolume effect of only +0.23 %, where MP's deficit is 1.4 %,
+# six times larger. So the small value is unexplained.
+#
+# Ni is the substrate of all 186 Ni_* interfaces, and MAX_ATOMS_INTERFACE has only
+# 4 atoms of headroom, so importing an unexplained outlier here is the highest-risk
+# change available. 3.52 is also the midpoint of the spread
+# (MP 3.475 < published PBE 3.513 < exp 3.524 < our RPBE 3.564).
+#
+# Left at 3.52 rather than the exact experimental 3.524: the 0.004 Å difference is
+# cosmetic, and holding it fixed keeps the Ni sublattice of all 186 interfaces
+# byte-identical to before this change, so any interface that does move can be
+# attributed to its film alone.
+NI_A = 3.52                 # Å, experimental (NOT mp-23's 3.4751; see above)
 
 
 # ── Validation helpers ───────────────────────────────────────────
@@ -303,9 +322,47 @@ def create_tmd_monolayer(formula, a, thickness):
     return ortho
 
 
+# ── Bulk lattice constants: Materials Project relaxed (PBE/PBE+U) ────────────
+#
+# Retrieved 2026-08-12 from MP's public OPTIMADE mirror
+# (https://optimade.materialsproject.org/v1/structures -- no API key needed).
+# Every entry was matched BY SPACE GROUP against the from_spacegroup call that uses
+# it, never by formula: matching on formula alone is how the wrong polymorphs got in
+# (MoP as cubic, Mo2N as rock-salt, MoS2 as a single layer). Where two entries shared
+# the target space group, the tie was broken on MP's energy_above_hull.
+#
+# WHY MP-PBE AND NOT OUR OWN RPBE: OC20 -- the dataset UMA's `oc20` head was trained
+# on, and whose DFT settings GPAW_CONFIG copies -- took its bulks from Materials
+# Project and cut slabs from MP's PBE(+U)-relaxed cells, then computed energies with
+# RPBE at fixed cell. OC20 is PBE geometry + RPBE energetics. Relaxing these bulks
+# under RPBE instead would move us AWAY from the training distribution: measured, RPBE
+# prefers ~1 % larger lattice constants than PBE (fcc Ni 3.564 vs 3.513). Nothing in
+# either pipeline relaxes a cell, so whatever is written here is frozen all the way
+# through to Delta-G_H.
+#
+# ⚠ NOTE ON Ni: MP's Ni (mp-23, a=3.4751) is deliberately NOT adopted -- see NI_A.
+#
+# ⚠ These changed ~1 %, and the _assert_coordination cutoffs below are ABSOLUTE
+# distances tuned against the old experimental constants. All nine were re-verified
+# against the new cells (2026-08-12) and all pass. Two have little room left before a
+# counted bond would fall outside its cutoff:
+#     MoS2  Mo-S  cutoff 2.6: longest real bond 2.525  (0.075 Å of room)
+#     MoB   B-Mo  cutoff 2.7: longest real bond 2.633  (0.067 Å of room)
+# Both are safe in the other direction -- the next coordination shell is 4.96 and
+# 3.75 Å respectively, so there is no ambiguity about what is being counted, and a
+# cutoff could be widened toward mid-gap if a future constant grows another ~2 %.
+# Re-run the margin check if you touch any constant here.
 def create_mos2_bulk():
-    """2H-MoS2 bulk, P6_3/mmc (#194), two S-Mo-S layers per cell (mp-1018809)."""
-    a, c = 3.160, 12.295  # Å
+    """2H-MoS2 bulk, P6_3/mmc (#194), two S-Mo-S layers per cell.
+
+    mp-2815 (MP relaxed, retrieved 2026-08-12; E_above_hull 1.7 meV/atom, vs
+    2.4 for the mp-1018809 this used to cite -- both are 2H, the margin is noise,
+    but mp-2815 is also the canonical entry). Was experimental 3.160 / 12.295.
+    The +8.8 % on c is PBE's missing dispersion, which cannot hold a vdW gap;
+    accepted for OC20 consistency and near-harmless here because every MoS2
+    structure we build is a single monolayer.
+    """
+    a, c = 3.1922, 13.3783  # Å, MP-relaxed (mp-2815)
     lattice = Lattice.hexagonal(a, c)
     struct = Structure.from_spacegroup(
         "P6_3/mmc", lattice, ["Mo", "S"], [[1 / 3, 2 / 3, 1 / 4], [1 / 3, 2 / 3, 0.621]]
@@ -317,8 +374,14 @@ def create_mos2_bulk():
 
 
 def create_mose2_bulk():
-    """2H-MoSe2 bulk, P6_3/mmc (#194), two Se-Mo-Se layers per cell."""
-    a, c = 3.289, 12.929  # Å
+    """2H-MoSe2 bulk, P6_3/mmc (#194), two Se-Mo-Se layers per cell.
+
+    mp-1634 (MP relaxed, retrieved 2026-08-12). Sits exactly ON the convex hull
+    (E_above_hull = 0.0) where the other #194 candidate, mp-1018807, is at
+    3.3 meV/atom -- an unambiguous pick. Was experimental 3.289 / 12.929; the
+    +4.8 % on c is PBE's missing dispersion, same caveat as MoS2 above.
+    """
+    a, c = 3.3223, 13.5430  # Å, MP-relaxed (mp-1634)
     lattice = Lattice.hexagonal(a, c)
     struct = Structure.from_spacegroup(
         "P6_3/mmc", lattice, ["Mo", "Se"], [[1 / 3, 2 / 3, 1 / 4], [1 / 3, 2 / 3, 0.620]]
@@ -330,8 +393,13 @@ def create_mose2_bulk():
 
 
 def create_mop_bulk():
-    """WC-type MoP bulk, hexagonal P-6m2 (#187), mp-219."""
-    a, c = 3.23, 3.21  # Å
+    """WC-type MoP bulk, hexagonal P-6m2 (#187), mp-219.
+
+    MP relaxed, retrieved 2026-08-12; sole #187 candidate (the other MoP entries
+    are cubic Fm-3m / F-43m, i.e. the wrong polymorph -- exactly what the
+    space-group match is there to exclude). Was experimental 3.23 / 3.21.
+    """
+    a, c = 3.2348, 3.1823  # Å, MP-relaxed (mp-219)
     lattice = Lattice.hexagonal(a, c)
     struct = Structure.from_spacegroup(
         "P-6m2", lattice, ["P", "Mo"], [[0, 0, 0], [1 / 3, 2 / 3, 0.5]]
@@ -351,8 +419,13 @@ def create_mo2n_bulk():
     I4_1/amd origin-choice/Wyckoff-label combination for this ordering wasn't
     reproduced cleanly with pymatgen's space-group generators; coordination
     is asserted below instead.
+
+    mp-27953 (MP relaxed, retrieved 2026-08-12), sole #141 candidate. Was 4.20 / 8.00.
+    Note c/a moves from 1.905 to 1.868, so this is a change of cell SHAPE, not just
+    scale -- the coordination asserts below are the check that the hand-built
+    fractional coordinates still describe the same ordering at the new ratio.
     """
-    a, c = 4.20, 8.00  # Å
+    a, c = 4.2556, 7.9502  # Å, MP-relaxed (mp-27953)
     cell = np.diag([a, a, c])
 
     mo_frac = [
@@ -382,8 +455,19 @@ def create_mo2c_bulk():
     it was not beta-Mo2C at all. Coordinates from Christensen (1977) /
     arXiv:2201.12706 Table 1; from_spacegroup expands the Wyckoff orbits so the
     full 12-atom cell is generated correctly.
+
+    mp-1552 (MP relaxed, retrieved 2026-08-12), sole #60 candidate.
+
+    ⚠ AXES DELIBERATELY PERMUTED. MP lists this cell as a=4.7285, b=5.2098,
+    c=6.0526 -- b and c swapped relative to our setting. It is the same physical
+    crystal, but Miller indices are interpreted in the basis of whatever this
+    function returns, so transcribing MP's order verbatim would silently redefine
+    Mo2C_(110) as the plane we call (101) while the directory name stayed the same.
+    Written here in OUR order (b = the ~6.05 Å axis) to keep every existing Mo2C
+    facet label meaning what it has always meant. Same reason create_slab does not
+    call standardize_bulk. Do not "tidy" these into ascending order.
     """
-    a, b, c = 4.725, 6.022, 5.195  # Å, experimental
+    a, b, c = 4.7285, 6.0526, 5.2098  # Å, MP-relaxed (mp-1552), b/c in OUR axis order
     lattice = Lattice.orthorhombic(a, b, c)
     struct = Structure.from_spacegroup(
         "Pbcn", lattice, ["Mo", "C"],
@@ -406,8 +490,12 @@ def create_mob_bulk():
     trigonal-prismatic Mo cage. The previous hand-typed "8e" list did not lie
     on a valid I4_1/amd orbit and produced 0.76 Å Mo-B overlaps (detected SG
     Cmmm) -- from_spacegroup generates the correct orbit instead.
+
+    mp-1890 (MP relaxed, retrieved 2026-08-12), sole #141 candidate. Was
+    experimental 3.105 / 16.97 -- the smallest change of the six (+0.36 % / +0.11 %),
+    so the Kiessling z-parameters above still hold.
     """
-    a, c = 3.105, 16.97  # Å, experimental
+    a, c = 3.1162, 16.9892  # Å, MP-relaxed (mp-1890)
     lattice = Lattice.tetragonal(a, c)
     struct = Structure.from_spacegroup(
         "I4_1/amd", lattice, ["Mo", "B"], [[0, 0, 0.197], [0, 0, 0.352]]
@@ -1138,10 +1226,15 @@ FACETS = {
 # site generation restricted to a radius around the defect, in AdsorbML step 2.
 MIN_AB_DEFECT = MIN_AB
 
-# 2H-TMD monolayer params: (in-plane a, S-S vertical thickness) Å.
+# 2H-TMD monolayer params: (in-plane a, chalcogen-chalcogen vertical thickness) Å.
+# `a` MUST track create_mos2_bulk / create_mose2_bulk -- it is the same physical
+# quantity written twice, and the two silently drifting apart would mean the basal
+# slabs and the edge ribbons of one material used different lattice constants.
+# Both updated to the MP-relaxed values 2026-08-12 (mp-2815 / mp-1634); the vertical
+# thicknesses are unchanged, being intra-layer distances PBE gets right.
 TMD_PARAMS = {
-    'MoS2':  (3.160, 3.19),
-    'MoSe2': (3.289, 3.34),
+    'MoS2':  (3.1922, 3.19),
+    'MoSe2': (3.3223, 3.34),
 }
 
 
