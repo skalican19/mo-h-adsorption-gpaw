@@ -21,6 +21,13 @@ from pymatgen.io.ase import AseAtomsAdaptor
 from pymatgen.analysis.interfaces.zsl import ZSLGenerator
 from pymatgen.analysis.interfaces.coherent_interfaces import CoherentInterfaceBuilder
 
+# The correct z-layer grouping already exists in the AdsorbML tagging module, which
+# is pure numpy (its ASE imports are lazy; no fairchem, no torch), so reusing it
+# adds no dependency and leaves one implementation instead of two. This file is in
+# scripts/, so its own directory is what makes `adsorbml` resolve.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from adsorbml.tagging import layer_groups
+
 
 # ── Slab sizing convention (OC20) ────────────────────────────────
 #
@@ -51,10 +58,22 @@ MIN_AB = 8.0                # Å, both in-plane vectors (OC20 min_ab)
 MAX_ATOMS_TARGET = 250      # OC22's published per-slab ceiling; a warning, not a hard cap
 # ZSL coincidence cells are irreducibly larger: an interface is two slabs, and the
 # in-plane cell is set by the lattice mismatch rather than by any thickness choice.
-# 600 admits every match the current systems produce (largest is Ni/Mo2C(111) at 512)
-# while still catching a regression that blows the cell up -- the pre-fix
-# Ni_MoS2_interface_(100) was 948 atoms. A feasibility guard, not a convention.
+# 600 admits every match the current systems produce while still catching a regression
+# that blows the cell up -- the pre-fix Ni_MoS2_interface_(100) was 948 atoms. A
+# feasibility guard, not a convention.
+# ⚠ Headroom is 4 atoms, not the comfortable margin this comment used to claim: the
+# largest emitted structure is Ni_MoB_interface_(111)_cluster4* at 596 (the ZSL match
+# itself is 592), NOT Ni/Mo2C(111) at 512. A small builder change -- or the ~1 % cell
+# change from switching to relaxed lattice constants -- can push a match over the cap,
+# after which _build_zsl_interface silently substitutes a higher-strain alternative or
+# raises. Re-measure the maximum after anything that moves a lattice constant.
 MAX_ATOMS_INTERFACE = 600
+
+# Ni fcc lattice constant, used by every Ni-substrate interface AND by the facet
+# spacing table below. It lives here as one constant because the table is a
+# regression guard derived FROM it: change the value in the `ase_bulk` calls alone
+# and the guard silently starts asserting the wrong spacing.
+NI_A = 3.52                 # Å
 
 
 # ── Validation helpers ───────────────────────────────────────────
@@ -97,22 +116,45 @@ def _min_covalent_radius_ratio(atoms):
 
 
 def _z_layers(z_values, tol=0.5):
-    """Collapse a 1-D array of z coordinates into sorted layer centroids."""
-    zs = np.sort(np.asarray(z_values))
-    layers = [[zs[0]]]
-    for z in zs[1:]:
-        if z - layers[-1][-1] < tol:
-            layers[-1].append(z)
-        else:
-            layers.append([z])
-    return np.array([np.mean(l) for l in layers])
+    """Collapse a 1-D array of z coordinates into sorted layer centroids.
+
+    Delegates the grouping to `adsorbml.tagging.layer_groups`, which measures each
+    atom against its layer's HIGHEST member rather than against the previously added
+    atom. The old local version chained: on a gently sloping sublattice every
+    successive atom sat within `tol` of the last one, so the whole slab collapsed into
+    a single "layer" -- Mo2C(110) and Mo2C(111) both reported 1 layer instead of 16
+    and 21. That merges layers, which SHRINKS the largest measured gap, which is
+    exactly the quantity `_assert_film_integrity` uses to detect a sliced film: a
+    genuinely severed sheet could have passed.
+
+    `tol` is passed through explicitly (tagging's own default is 0.4 Å) so that
+    changing the grouping algorithm did not silently also change the tolerance.
+    """
+    zs = np.asarray(z_values, dtype=float)
+    if zs.size == 0:
+        return np.array([])
+    centroids = [float(np.mean(zs[group])) for group in layer_groups(zs, tol=tol)]
+    return np.array(sorted(centroids))
 
 
-# fcc interlayer spacing d_hkl (Å) for a=3.52 Ni, per facet actually used.
+# fcc interlayer spacing d_hkl (Å) for Ni, per facet actually used.
 # (100) stacks every a/2; (111) every a/sqrt(3). A degenerate primitive-cell
 # Ni bulk made both Miller strings cut the same {111} planes -- this table lets
 # the substrate assert catch that regression by measuring the real spacing.
-_NI_FACET_SPACING = {(1, 0, 0): 3.52 / 2, (1, 1, 1): 3.52 / np.sqrt(3)}
+# Derived from NI_A so it cannot drift out of step with the bulk it checks.
+_NI_FACET_SPACING = {(1, 0, 0): NI_A / 2, (1, 1, 1): NI_A / np.sqrt(3)}
+
+# Ni substrate thickness in pymatgen LAYERS, per facet, for the one interface builder
+# that must pass layers rather than Å (see create_ni_mxene_interface). Each value is
+# the smallest that still clears MIN_SLAB_THICKNESS.
+#
+# One shared value cannot serve both facets: a "layer" is an oriented-cell repeat, not
+# an atomic plane, and the two facets differ in how many planes that is -- on (100) one
+# layer is 2 planes (d=1.76 Å), on (111) it is 1 (d=2.03 Å). Measured material thickness
+# of the Ni sublattice in the emitted interface:
+#     (100): 2 layers -> 4 planes ->  7.04 Å    (was 4 layers -> 8 planes -> 14.08 Å)
+#     (111): 4 layers -> 4 planes ->  8.13 Å    (unchanged; 2 layers gives 6.10 Å, thin)
+_NI_SUBSTRATE_LAYERS = {(1, 0, 0): 2, (1, 1, 1): 4}
 
 
 def _assert_substrate_facet(interface, symbol, miller, label):
@@ -428,9 +470,16 @@ def create_mxene_basal_slab(min_ab=MIN_AB, vacuum=MIN_VACUUM):
     return sheet
 
 
-def create_graphene_sheet(size=(4, 4, 1), vacuum=MIN_VACUUM):
-    """Create a graphene sheet slab."""
-    a = 2.46  # Å, graphene lattice constant
+def create_graphene_sheet(size=None, vacuum=MIN_VACUUM, min_ab=MIN_AB):
+    """Create a graphene sheet slab.
+
+    Sized by the `min_ab` threshold, not by a fixed repeat count. The old hard-coded
+    (4, 4, 1) cleared OC20's 8 Å only coincidentally -- 4 x 2.46 = 9.84 Å -- and would
+    have violated it silently had `a` changed. `size` stays available as an explicit
+    override for a deliberately larger cell. At a = 2.46 the derived tiling is exactly
+    (4, 4, 1), so this changes no structure today; it is a guard, not a resize.
+    """
+    a = 2.46  # Å, graphene lattice constant (experiment and PBE agree; no change owed)
 
     cell = np.array([
         [a, 0, 0],
@@ -447,12 +496,12 @@ def create_graphene_sheet(size=(4, 4, 1), vacuum=MIN_VACUUM):
     bulk = Atoms(symbols, cell=cell, pbc=[True, True, True])
     bulk.set_scaled_positions(positions)
 
-    sheet = bulk.repeat(size)
+    sheet = bulk.repeat(size) if size is not None else _tile_to_min_ab(bulk, min_ab)
     sheet.set_pbc([True, True, False])
     return _ensure_z_clearance(sheet, min_vacuum=vacuum)
 
 
-def create_n_doped_graphene(size=(4, 4, 1), vacuum=MIN_VACUUM):
+def create_n_doped_graphene(size=None, vacuum=MIN_VACUUM):
     """Create N-doped graphene (one C replaced by N)."""
     sheet = create_graphene_sheet(size=size, vacuum=vacuum)
     # Replace the C atom closest to center with N
@@ -536,13 +585,20 @@ def create_slab(bulk_atoms, miller="(100)", min_ab=MIN_AB,
         primitive=True,
         max_normal_search=1,
     )
-    # max_broken_bonds=0 keeps the cut from severing bonds, which is what stops a
-    # layered crystal being sliced through the middle of a covalent sandwich.
+    # Transcribed verbatim from fairchem's OC20 call. NOTE: `max_broken_bonds=0` is a
+    # no-op here and does NOT stop a covalent sandwich being sliced. pymatgen only
+    # counts broken bonds when a `bonds` dict is supplied (pymatgen/core/surface.py:
+    # `z_ranges = [] if bonds is None else get_z_ranges(bonds, ztol)`), so with
+    # bonds=None the count stays 0 for every shift and EVERY termination is accepted.
+    # What actually keeps the layered materials intact is that they bypass this
+    # function entirely -- see create_tmd_basal_slab / create_mxene_basal_slab.
+    # Passing a real `bonds` dict is the ambitious version; it would only matter if a
+    # layered compound were ever routed through here.
     slabs = generator.get_slabs(tol=0.3, bonds=None, max_broken_bonds=0, symmetrize=False)
     if not slabs:
         raise ValueError(
             f"SlabGenerator found no {indices} termination at min_slab_size="
-            f"{min_thickness} Å (max_broken_bonds=0); facet may not be cleavable"
+            f"{min_thickness} Å; facet may not be cleavable"
         )
     slabs = slabs + [_flip_slab_z(s) for s in slabs if not s.is_symmetric()]
     if termination >= len(slabs):
@@ -655,6 +711,38 @@ def create_edge_ribbon(bulk_atoms, width=6, length=2, vacuum=MIN_VACUUM, edge_ty
     return ribbon
 
 
+# Å below the slab's topmost atom that a defect site may sit and still count as
+# surface. Measured separation on the current inputs is clean: every exposed dopant
+# is within 0.8 Å of z_max, while the buried ones sit at 1.18 Å (Mo2C(100), under a
+# C face) and 1.36 Å (Mo2N(112), under an N face).
+BURIAL_TOL = 0.8
+
+
+def _assert_surface_species(slab, symbol, target_idx, action, burial_tol=BURIAL_TOL):
+    """Raise if the topmost `symbol` atom is buried beneath the slab's real surface.
+
+    Each defect builder picks its site as the highest atom OF ITS OWN SPECIES, which is
+    the right way to choose *which* atom to modify but says nothing about whether that
+    atom is at the surface. On an anion-terminated facet the topmost metal sits a full
+    layer down, so the defect is created under an intact anion sheet where no adsorbate
+    can reach it.
+
+    All three builders previously relied on `z_top = max(z[target_idx])` as their only
+    guard, which cannot fail by construction -- the maximum is itself a member of the
+    set it is compared against -- so their "refusing to dope a buried atom" branches
+    were unreachable. This is the check that makes those docstrings true.
+    """
+    z = slab.get_positions()[:, 2]
+    depth = float(z.max() - np.max(z[target_idx]))
+    if depth > burial_tol:
+        raise ValueError(
+            f"topmost {symbol} atom sits {depth:.2f} A below the slab surface "
+            f"(> {burial_tol} A), so {action} would bury the defect under another "
+            f"species; this facet exposes a different termination -- pick a "
+            f"termination whose surface contains {symbol}, or target the exposed species"
+        )
+
+
 def create_vacancy_slab(slab, vacancy_symbol, tol=0.5):
     """Remove one top-layer atom (of its own species' top layer) to create a vacancy."""
     positions = slab.get_positions()
@@ -663,6 +751,8 @@ def create_vacancy_slab(slab, vacancy_symbol, tol=0.5):
     target_idx = [i for i, atom in enumerate(slab) if atom.symbol == vacancy_symbol]
     if not target_idx:
         raise ValueError(f"No {vacancy_symbol} atoms in slab; cannot create a vacancy")
+
+    _assert_surface_species(slab, vacancy_symbol, target_idx, "removing one")
 
     z_top = np.max(z_positions[target_idx])
     candidates = [i for i in target_idx if (z_top - z_positions[i]) < tol]
@@ -690,6 +780,8 @@ def create_multi_vacancy_slab(slab, vacancy_symbol, count=2, tol=0.5):
         raise ValueError(
             f"Only {len(target_idx)} {vacancy_symbol} atom(s) in slab; cannot remove {count}"
         )
+
+    _assert_surface_species(slab, vacancy_symbol, target_idx, f"removing {count}")
 
     z_top = np.max(z_positions[target_idx])
     surface_candidates = [i for i in target_idx if (z_top - z_positions[i]) < tol]
@@ -737,6 +829,9 @@ def create_substitution_slab(slab, target_symbol, dopant_symbol, tol=0.5):
     target_idx = [i for i, atom in enumerate(slab) if atom.symbol == target_symbol]
     if not target_idx:
         raise ValueError(f"No {target_symbol} atoms in slab; cannot place {dopant_symbol} dopant")
+
+    _assert_surface_species(slab, target_symbol, target_idx,
+                            f"substituting {dopant_symbol}")
 
     z_top = np.max(z_positions[target_idx])
     candidates = [i for i in target_idx if (z_top - z_positions[i]) < tol]
@@ -886,7 +981,7 @@ def create_ni_mox_interface(mox_bulk_builder, miller="(111)", separation=2.2, st
     # SAME conventional {111} planes -- a degeneracy that silently gave every
     # "_(100)" interface a Ni(111) substrate. The conventional 4-atom cell
     # interprets Miller indices in the cubic basis as intended.
-    ni_bulk = ase_bulk("Ni", "fcc", a=3.52, cubic=True)
+    ni_bulk = ase_bulk("Ni", "fcc", a=NI_A, cubic=True)
     mox_bulk = mox_bulk_builder()
     film_idx = indices if film_miller is None else tuple(film_miller)
     interface = _build_zsl_interface(
@@ -909,17 +1004,30 @@ def create_ni_mxene_interface(miller="(111)", separation=2.2, strain_tol=0.03, m
 
     This is the one caller that passes thicknesses in LAYERS rather than Å: one
     "layer" of the film is one intact O-Ti-C-Ti-C-Ti-O sheet, which is exactly the
-    quantity we want to hold at 1, and an Å target would cut through it. 4 Ni layers
-    is 7.1 Å of material on (100) and 8.1 Å on (111), so the substrate still clears
-    OC20's 7 Å.
+    quantity we want to hold at 1, and an Å target would cut through it.
+
+    The substrate thickness is therefore ALSO in layers, and must be read per facet
+    from `_NI_SUBSTRATE_LAYERS` -- a layer is an oriented-cell repeat, not an atomic
+    plane, so a single number means different amounts of material on (100) and (111).
+    A flat `substrate_thickness=4` used to mean 8 planes / 14.08 Å on (100), double the
+    intended ~7 Å and 60 % of that cell's atoms, while meaning a correct 4 planes /
+    8.13 Å on (111). This is the same layers-vs-planes trap `_build_zsl_interface`
+    warns about for the film, biting the substrate in the same call.
     """
-    ni_bulk = ase_bulk("Ni", "fcc", a=3.52, cubic=True)
+    ni_bulk = ase_bulk("Ni", "fcc", a=NI_A, cubic=True)
     mxene_bulk = create_ti3c2_bulk()
     indices = _parse_miller(miller)
+    substrate_layers = _NI_SUBSTRATE_LAYERS.get(indices)
+    if substrate_layers is None:
+        raise ValueError(
+            f"Ni substrate layer count not tabulated for facet {indices}; add it to "
+            f"_NI_SUBSTRATE_LAYERS (smallest layer count clearing "
+            f"{MIN_SLAB_THICKNESS} Å) rather than guessing a shared value"
+        )
     interface = _build_zsl_interface(
         ni_bulk, mxene_bulk, substrate_miller=indices, film_miller=(0, 0, 1),
         separation=separation, strain_tol=strain_tol,
-        in_layers=True, film_thickness=1, substrate_thickness=4,
+        in_layers=True, film_thickness=1, substrate_thickness=substrate_layers,
         max_atoms=max_atoms,
     )
     _assert_substrate_facet(interface, "Ni", indices, label=f"Ni/MXene {miller}")
@@ -930,7 +1038,7 @@ def create_ni_mxene_interface(miller="(111)", separation=2.2, strain_tol=0.03, m
     return interface
 
 
-def create_ni_on_graphene(ni_atoms=4, height=1.8, size=(4, 4, 1), vacuum=MIN_VACUUM):
+def create_ni_on_graphene(ni_atoms=4, height=1.8, size=None, vacuum=MIN_VACUUM):
     """Create Ni cluster on graphene sheet."""
     sheet = create_graphene_sheet(size=size, vacuum=vacuum)
     sheet = add_cluster_on_surface(sheet, "Ni", n_atoms=ni_atoms, height=height)
@@ -938,7 +1046,7 @@ def create_ni_on_graphene(ni_atoms=4, height=1.8, size=(4, 4, 1), vacuum=MIN_VAC
     return sheet
 
 
-def create_ni_on_n_doped_graphene(ni_atoms=4, height=1.8, size=(4, 4, 1), vacuum=MIN_VACUUM):
+def create_ni_on_n_doped_graphene(ni_atoms=4, height=1.8, size=None, vacuum=MIN_VACUUM):
     """Create Ni cluster on N-doped graphene sheet."""
     sheet = create_n_doped_graphene(size=size, vacuum=vacuum)
     sheet = add_cluster_on_surface(sheet, "Ni", n_atoms=ni_atoms, height=height)

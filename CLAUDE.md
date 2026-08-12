@@ -61,7 +61,7 @@ requirements-adsorbml.txt     # ase, numpy, pandas, fairchem-core, fairchem-data
   `--kpts` overrides the mesh). CLI overrides default to None → inherit these config values.
 - `ENTROPY_CORRECTION = 0.24 eV`; `CORES_PER_CALC = 11`; `RAM_PER_CALC_GB = 4`.
 - AdsorbML step constants live in `scripts/adsorbml/_common.py` (FMAX 0.02,
-  MAX_STEPS_SLAB 300 for step 1 / MAX_STEPS_PLACEMENT 100 for step 2, NUM_PLACEMENTS 100,
+  MAX_STEPS_SLAB 300 for step 1 / MAX_STEPS_PLACEMENT 300 for step 2, NUM_PLACEMENTS 100,
   UMA_MODEL "uma-m-1p1", same 0.24 correction).
 - Both AdsorbML steps relax with **`BestFrameLBFGS`** (`_common.py`), not plain LBFGS:
   ASE's LBFGS has no line search, so the last frame can be worse than the input (in the
@@ -87,7 +87,8 @@ H neighbours a tag-0 atom).
 
 Because of the third, a frozen atom that H can physically touch turns every placement
 over it into a false rejection. The old `z > z_max - 2.0` rule did exactly that on
-**219/350 inputs**; the `Ni_*_cluster*` interfaces worst, freeing as few as 5 atoms of 262
+**219/350 inputs** (measured against the then-350-structure set; the current set is 342);
+the `Ni_*_cluster*` interfaces worst, freeing as few as 5 atoms of 262
 (the cluster apex sets `z_max`, so a 2 Å window leaves the whole substrate rigid). That is
 a real defect — surfaces that cannot relax — and it is fixed.
 
@@ -206,23 +207,63 @@ for edge ribbons, which need a rectangular cell. Interfaces pass thicknesses in 
 (`in_layers=False`, 7 Å film + 7 Å substrate); only `create_ni_mxene_interface` passes
 layers, because one "layer" there is one intact O-Ti-C-Ti-C-Ti-O sheet.
 
+⚠ Because that one caller is in layers, its **substrate** thickness is in layers too, and
+a layer is an oriented-cell repeat — so one number means different amounts of material per
+facet. It must be read per facet from `_NI_SUBSTRATE_LAYERS`: **(100) → 2 layers = 4 planes
+= 7.04 Å**, **(111) → 4 layers = 4 planes = 8.13 Å**. A single flat value cannot work: at 4
+it gave (100) 8 planes / 14.08 Å (double the intent, 60 % of that cell's atoms, 280 atoms
+→ 196 once fixed); at 2 it would give (111) only 6.10 Å, under OC20's floor. Same
+layers-vs-planes trap as below, biting the substrate instead of the film.
+
 Resulting sizes — every structure now has a wrap margin ≥ 5 Å:
 
 | | before | after |
 |---|---|---|
 | pristine slabs (14) | 63–256 atoms, 8–49 Å span | **27–144 atoms, 3.2–11.9 Å** |
 | vacancy/dopant slabs (117) | 430–576 atoms | **25–144 atoms** |
-| `Ni_*_interface_*` (186) | 312–950 atoms | 272–512 atoms |
-| `*_sheet` (8) | 384–768 atoms | **dropped** |
+| `Ni_*_interface_*` (186) | 312–950 atoms | 196–**596** atoms |
+| `Mo*_sheet` (8) | 384–768 atoms | **dropped** |
 
-The `_sheet` family is gone: it was a 4×4 yardstick that reproduced the 2×2 value to
+The `Mo*_sheet` family is gone: it was a 4×4 yardstick that reproduced the 2×2 value to
 1–3 meV, i.e. it confirmed the smaller cell is converged and then cost 4× per structure.
+(`graphene_sheet` is a different thing and still exists — it is not a yardstick.)
+
+⚠ Two corrections to that table: the interface maximum is **596**
+(`Ni_MoB_interface_(111)_cluster4*`), not 512 — only **4 atoms** under
+`MAX_ATOMS_INTERFACE`; and the lower bound drops to 196 once the MXene (100) substrate is
+un-doubled. The table also omits the edge/ribbon family, which holds the largest structures
+in the repo at **864** atoms (`MoB_edge_{Mo,B}_large`), 3.5× `MAX_ATOMS_TARGET`. Every
+number here is measured on the pre-regen inputs and must be re-measured after the lattice
+constants move.
 
 Known limits of the current sizing:
 - **`termination=0`** is the default and is arbitrary — no more so than the single cut
   `ase.build.surface` returned, but arbitrary. The list is `get_slabs()` results plus a
-  flipped copy of each asymmetric slab (`_flip_slab_z`), so both faces are reachable:
-  Mo₂C(100) has 2, MoP(001) 2, Mo₂C(110) 3, Mo₂C(111) 7, Mo₂N(001)/(100) 1.
+  flipped copy of each asymmetric slab (`_flip_slab_z`), so both faces are reachable.
+
+  Full measured table (2026-08-12). **Quote the total, and say which number you mean** —
+  the long-standing "Mo₂C(111) has 4 vs 7" and "MoB(111) has 3 vs 4" disagreements were
+  never a contradiction, just `get_slabs` count vs total-including-flips:
+
+  | facet | total | `get_slabs` | flips | `t=0` top layer | |
+  |---|---|---|---|---|---|
+  | `Mo2C_(100)` | 2 | 1 | 1 | C only | **anion-only** |
+  | `Mo2N_(112)` | 2 | 1 | 1 | N only | **anion-only** |
+  | `MoP_(001)` | 2 | 1 | 1 | P only | **anion-only** |
+  | `Mo2C_(110)` | 3 | 2 | 1 | Mo+C | mixed |
+  | `Mo2C_(111)` | 7 | 4 | 3 | Mo+C | mixed |
+  | `MoB_(111)` | 4 | 3 | 1 | Mo+B | mixed |
+  | `Mo2N_(001)` | 1 | 1 | 0 | Mo+N | mixed |
+  | `Mo2N_(100)` | 1 | 1 | 0 | Mo+N | mixed |
+  | `Mo2N_(111)` | 1 | 1 | 0 | Mo+N | mixed |
+  | `MoB_(100)` | 1 | 1 | 0 | Mo+B | mixed |
+  | `MoB_(110)` | 1 | 1 | 0 | Mo+B | mixed |
+
+  **5 facets have only one termination** — nothing to choose, including `Mo2N_(001)`, the
+  strongest candidate, so the headline result is untouched by this concern. The 3
+  anion-only facets are where it bites: H cannot reach metal at all, and every metal-site
+  defect on them is created under an intact anion sheet (see the burial guard below).
+  Regenerate this table from `create_slab`'s own out-of-range message rather than by hand.
 
   ⚠ **Two facets changed termination when the engine changed**, because `get_slabs` returns
   the anion face first where the old ase cut happened to land on metal:
@@ -245,8 +286,18 @@ Known limits of the current sizing:
   the compound dataset, uses ≥8 Å, 12 Å vacuum, symmetric slabs, all atoms free). **Checked
   on Mo₂N(001) 2026-08-10 and it holds** — see "Thickness convergence" below. Not re-checked
   for Mo₂C / MoB / MoP.
-- **MoB(111)** has no clean atomic layering (a z-clustering probe collapses its 8.8 Å into
-  one "plane"), so "surface layer" is ill-defined there. Predates this change.
+- **Metal-site defects on the 3 anion-only facets now raise.** `_assert_surface_species`
+  rejects any vacancy or substitution whose target species sits > 0.8 Å below the slab's
+  topmost atom. It fires on **18** structures — 7 dopants + `vacMo` + `vac2Mo` on each of
+  `Mo2C_(100)` (Mo 1.18 Å down, under C) and `Mo2N_(112)` (1.36 Å down, under N). They were
+  previously emitted silently: a defect buried beneath an intact anion sheet that no
+  adsorbate can reach. `MoP_(001)` is also anion-only but has no defect variants.
+  Resolving them needs the termination decision above, not a looser threshold.
+- ~~**MoB(111)** has no clean atomic layering~~ — **wrong, and it was never about MoB.**
+  MoB(111) resolves cleanly into **9** layers. The facets that collapsed to a single
+  "plane" were `Mo2C_(110)` and `Mo2C_(111)`, and the cause was the layer-grouping bug in
+  `_z_layers` (chaining against the previous atom instead of the layer's highest), now
+  fixed by delegating to `tagging.layer_groups`. Post-fix they read 16 and 21 layers.
 
 ### Thickness convergence (Mo₂N(001), UMA, 2026-08-10)
 
