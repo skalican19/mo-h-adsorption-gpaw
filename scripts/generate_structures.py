@@ -12,7 +12,7 @@ from ase.io import write
 from ase.constraints import FixAtoms
 from ase.build import bulk as ase_bulk, mx2, make_supercell
 from ase.neighborlist import neighbor_list
-from ase.data import covalent_radii
+from ase.data import covalent_radii, atomic_numbers
 import numpy as np
 
 from pymatgen.core import Lattice, Structure
@@ -937,10 +937,20 @@ def create_substitution_slab(slab, target_symbol, dopant_symbol, tol=0.5):
     return slab
 
 
-def add_cluster_on_surface(slab, element, n_atoms=2, height=1.8, spacing=2.4):
-    """Add a small cluster (2 or 4 atoms) above the top surface."""
+def add_cluster_on_surface(slab, element, n_atoms=2, height=None, spacing=2.4):
+    """Add a small cluster (2 or 4 atoms) above the top surface.
+
+    height=None derives the placement height from the covalent radii of the
+    cluster element and the slab's topmost atom, rather than a fixed 1.8 A --
+    that constant was a reasonable H-adatom height but placed noble/transition
+    metal clusters (Ag, Au, Ir, Pd, Pt, Ru) 25-35% closer than their covalent
+    bond length (e.g. Mo-Ag at 2.11 A vs a 2.99 A radii sum).
+    """
     positions = slab.get_positions()
     z_max = np.max(positions[:, 2])
+    top_symbol = slab[int(np.argmax(positions[:, 2]))].symbol
+    if height is None:
+        height = covalent_radii[atomic_numbers[element]] + covalent_radii[atomic_numbers[top_symbol]]
     center_xy = np.mean(positions[:, :2], axis=0)
 
     if n_atoms == 2:
@@ -1126,7 +1136,7 @@ def create_ni_mxene_interface(miller="(111)", separation=2.2, strain_tol=0.03, m
     return interface
 
 
-def create_ni_on_graphene(ni_atoms=4, height=1.8, size=None, vacuum=MIN_VACUUM):
+def create_ni_on_graphene(ni_atoms=4, height=None, size=None, vacuum=MIN_VACUUM):
     """Create Ni cluster on graphene sheet."""
     sheet = create_graphene_sheet(size=size, vacuum=vacuum)
     sheet = add_cluster_on_surface(sheet, "Ni", n_atoms=ni_atoms, height=height)
@@ -1134,7 +1144,7 @@ def create_ni_on_graphene(ni_atoms=4, height=1.8, size=None, vacuum=MIN_VACUUM):
     return sheet
 
 
-def create_ni_on_n_doped_graphene(ni_atoms=4, height=1.8, size=None, vacuum=MIN_VACUUM):
+def create_ni_on_n_doped_graphene(ni_atoms=4, height=None, size=None, vacuum=MIN_VACUUM):
     """Create Ni cluster on N-doped graphene sheet."""
     sheet = create_n_doped_graphene(size=size, vacuum=vacuum)
     sheet = add_cluster_on_surface(sheet, "Ni", n_atoms=ni_atoms, height=height)
